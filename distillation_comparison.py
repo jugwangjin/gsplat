@@ -2,7 +2,7 @@ import os
 import subprocess
 
 
-BASE_COMMAND = "CUDA_VISIBLE_DEVICES=1 python student_trainer.py distill2d --teacher_ckpt gsplat_teachers/bicycle_4/ckpts/ckpt_29999_rank0.pt --data_factor 4 --data_dir data/360_v2/bicycle/ --disable_viewer --strategy.grow_grad2d 0.0009 --apply_vis_on_teacher_sampling"
+BASE_COMMAND = "python student_trainer.py distill2d --teacher_ckpt gsplat_teachers/bicycle_4/ckpts/ckpt_29999_rank0.pt --data_factor 4 --data_dir data/360_v2/bicycle/ --disable_viewer --strategy.grow_grad2d 0.0009 --apply_vis_on_teacher_sampling"
 STUDENT_DIR = "gsplat_students_v7"
 
 def main():
@@ -32,8 +32,8 @@ def main():
     grow_grad2ds = [0.0002]
 
     commands = []
-
-    commands.append("CUDA_VISIBLE_DEVICES=1 python teacher_trainer.py default --data_factor 4 --data_dir data/360_v2/bicycle --disable_viewer --result_dir gsplat_teachers/bicycle_4")
+    if not os.path.exists("gsplat_teachers/bicycle_4/ckpts/ckpt_29999_rank0.pt"):
+        commands.append("python teacher_trainer.py default --data_factor 4 --data_dir data/360_v2/bicycle --disable_viewer --result_dir gsplat_teachers/bicycle_4")
 
     for combination in combinations:
         distill_sh_lambda = combination[0]
