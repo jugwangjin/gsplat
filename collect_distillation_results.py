@@ -23,7 +23,6 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4"):
       - gradient_key, sh_coeffs_mult, depths_mult, grow_grad2d
     """
     params = {}
-    # Remove prefix if present
     if subdir_name.startswith(prefix):
         rest = subdir_name[len(prefix):].lstrip('_')
         tokens = rest.split('_')
@@ -51,12 +50,12 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4"):
     else:
         params["distill_quats_lambda"] = tokens[3]
     
-    # The rest of the tokens contain gradient key and multipliers.
+    # Process remaining tokens for gradient key and multipliers.
     remaining = tokens[4:]
     if not remaining:
         return params
 
-    # Check for means2d case
+    # Handle the means2d case separately.
     if remaining[0] == "means2d":
         params["gradient_key"] = "means2d"
         for token in remaining[1:]:
@@ -64,7 +63,7 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4"):
                 params["grow_grad2d"] = token[6:]
         return params
 
-    # Convert lambda strings to floats (defaulting to 0 if empty)
+    # Convert lambda strings to floats to decide how many multiplier tokens are expected.
     try:
         sh_lambda = float(params["distill_sh_lambda"])
     except ValueError:
@@ -75,7 +74,7 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4"):
         depth_lambda = 0.0
 
     total_remaining = len(remaining)
-    # For both nonzero, expect last three tokens to be: sh multiplier, depth multiplier, grow2d.
+    # Case 1: Both sh and depth lambdas > 0 -> last three tokens: sh multiplier, depth multiplier, grow2d.
     if sh_lambda > 0 and depth_lambda > 0:
         if total_remaining >= 4:
             gradient_key_tokens = remaining[:total_remaining - 3]
@@ -89,7 +88,7 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4"):
                     params["grow_grad2d"] = token[6:]
         else:
             params["gradient_key"] = remaining[0]
-    # For only sh > 0, expect last two tokens: sh multiplier and grow2d.
+    # Case 2: Only sh lambda > 0 -> last two tokens: sh multiplier and grow2d.
     elif sh_lambda > 0:
         if total_remaining >= 3:
             gradient_key_tokens = remaining[:total_remaining - 2]
@@ -101,7 +100,7 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4"):
                     params["grow_grad2d"] = token[6:]
         else:
             params["gradient_key"] = remaining[0]
-    # For only depth > 0, expect last two tokens: depth multiplier and grow2d.
+    # Case 3: Only depth lambda > 0 -> last two tokens: depth multiplier and grow2d.
     elif depth_lambda > 0:
         if total_remaining >= 3:
             gradient_key_tokens = remaining[:total_remaining - 2]
@@ -114,7 +113,7 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4"):
         else:
             params["gradient_key"] = remaining[0]
     else:
-        # Both lambdas are zero. If extra tokens exist, assume they form the gradient key.
+        # Both lambdas are zero; join all remaining tokens.
         params["gradient_key"] = "_".join(remaining)
     
     return params
@@ -124,13 +123,14 @@ def analyze_students_dir(students_dir, output_csv, prefix="bicycle_4"):
     Recursively scan the given students_dir for subdirectories that contain a
     stats/val_step9999.json file. For each valid JSON, read the stats and parse
     the subdirectory name (using the training script naming convention) to extract
-    training parameters. The combined data is then saved into a CSV file.
+    training parameters. Then, a dedicated teacher reference row is added from:
+    gsplat_teachers/bicycle_4/stats/val_step29999.json.
+    The combined data is then saved into a CSV file.
     """
     results = []
     
-    # Walk recursively through the students_dir.
+    # Process student directories.
     for root, dirs, files in os.walk(students_dir):
-        # Check if this directory contains a "stats" folder with the JSON file.
         stats_dir = os.path.join(root, "stats")
         json_file = os.path.join(stats_dir, "val_step9999.json")
         if os.path.exists(json_file):
@@ -142,22 +142,42 @@ def analyze_students_dir(students_dir, output_csv, prefix="bicycle_4"):
                 print(f"Error reading {json_file}: {e}")
                 continue
             
-            # Parse the subdirectory name to extract training parameters.
             parsed_params = parse_subdir_name(subdir_name, prefix=prefix)
-            # Combine the parsed parameters with the stats.
             combined = {"subdirectory": subdir_name}
             combined.update(parsed_params)
             combined.update(stats)
             results.append(combined)
     
+    # Add the fixed teacher reference case.
+    teacher_stats_file = os.path.join("../gsplat_teachers", "bicycle_4", "stats", "val_step29999.json")
+    if os.path.exists(teacher_stats_file):
+        try:
+            with open(teacher_stats_file, 'r') as f:
+                teacher_stats = json.load(f)
+            teacher_row = {
+                "subdirectory": "teacher_reference",
+                "distill_sh_lambda": "",
+                "distill_colors_lambda": "",
+                "distill_depth_lambda": "",
+                "distill_quats_lambda": "",
+                "gradient_key": "teacher",
+                "sh_coeffs_mult": "",
+                "depths_mult": "",
+                "grow_grad2d": "",
+            }
+            teacher_row.update(teacher_stats)
+            results.append(teacher_row)
+        except Exception as e:
+            print(f"Error reading teacher stats file {teacher_stats_file}: {e}")
+    else:
+        print(f"Teacher stats file not found: {teacher_stats_file}")
     if not results:
         print("No valid JSON files found.")
         return
 
-    # Sort the results by psnr and ssim (both in descending order).
-    results.sort(key=lambda x: (x.get("num_GS", 0), x.get("psnr", 0), x.get("ssim", 0)), reverse=True)
+    # Sort the results by psnr and ssim in descending order.
+    results.sort(key=lambda x: (x.get("psnr", 0), x.get("ssim", 0)), reverse=True)
     
-    # Define the CSV header.
     header = [
         "subdirectory",
         "distill_sh_lambda",
@@ -175,12 +195,10 @@ def analyze_students_dir(students_dir, output_csv, prefix="bicycle_4"):
         "num_GS"
     ]
     
-    # Write the aggregated data to a CSV file.
     with open(output_csv, 'w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=header)
         writer.writeheader()
         for item in results:
-            # Ensure each expected column is present.
             row = {key: item.get(key, "") for key in header}
             writer.writerow(row)
     
@@ -188,7 +206,7 @@ def analyze_students_dir(students_dir, output_csv, prefix="bicycle_4"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze student subdirectories for stats and training parameters from val_step9999.json."
+        description="Analyze student subdirectories for stats and training parameters from val_step9999.json and add a teacher reference case."
     )
     parser.add_argument('--students_dir', type=str, default='../gsplat_students_v6', 
                         help="Path to the directory containing student subdirectories")

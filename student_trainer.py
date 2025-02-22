@@ -93,7 +93,7 @@ class Config:
     max_steps: int = 10_000
     # max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [500, 2_500, 5_000, 10_000])
+    eval_steps: List[int] = field(default_factory=lambda: [500, 5_000, 10_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [10_000])
     # Whether to save ply file (storage size can be large)

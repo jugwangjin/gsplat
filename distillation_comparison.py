@@ -2,23 +2,20 @@ import os
 import subprocess
 
 
-BASE_COMMAND = "python student_trainer.py distill2d --teacher_ckpt ../gsplat_teachers/bicycle_4/ckpts/ckpt_29999_rank0.pt --data_factor 4 --data_dir data/360_v2/bicycle/ --disable_viewer --strategy.grow_grad2d 0.0009 --apply_vis_on_teacher_sampling"
-STUDENT_DIR = "../gsplat_students_v7"
+BASE_COMMAND = "CUDA_VISIBLE_DEVICES=1 python student_trainer.py distill2d --teacher_ckpt ../gsplat_teachers/bicycle_4/ckpts/ckpt_29999_rank0.pt --data_factor 4 --data_dir data/360_v2/bicycle/ --disable_viewer --strategy.grow_grad2d 0.0009 --apply_vis_on_teacher_sampling"
+STUDENT_DIR = "gsplat_students_v7"
 
 def main():
+
+
     distill_lambda_keys = ['sh', 'colors', 'depth', 'quats']
     key_for_gradient = ['depths_and_sh', 'rendered_sh_coeffs', 'sh_coeffs', 'depths', ]
 
     BASIC_output_dir_name = 'bicycle_4'
 
-    sh_coeffs_mults = [4., 10., 20.]
+    sh_coeffs_mults = [4, 8, 16]
 
     combinations = []
-    combinations.append([1e-1, 0, 1e-1, 0])
-    combinations.append([1e-1, 0, 0, 0])
-    combinations.append([0, 1e-1, 0, 0])
-    combinations.append([0, 0, 1e-1, 0])
-    combinations.append([0, 0, 0, 1e-1])
 
     combinations.append([5e-1, 0, 5e-1, 0])
     combinations.append([5e-1, 0, 0, 0])
@@ -26,10 +23,17 @@ def main():
     combinations.append([0, 0, 5e-1, 0])
     combinations.append([0, 0, 0, 5e-1])
 
+    combinations.append([1, 0, 1, 0])
+    combinations.append([1, 0, 0, 0])
+    combinations.append([0, 1, 0, 0])
+    combinations.append([0, 0, 1, 0])
+    combinations.append([0, 0, 0, 1])
 
     grow_grad2ds = [0.0002]
 
     commands = []
+
+    commands.append("CUDA_VISIBLE_DEVICES=1 python teacher_trainer.py default --data_factor 4 --data_dir data/360_v2/bicycle --disable_viewer --result_dir gsplat_teachers/bicycle_4")
 
     for combination in combinations:
         distill_sh_lambda = combination[0]

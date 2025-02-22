@@ -76,7 +76,7 @@ def download_and_extract(url: str, download_path: Path, extract_path: Path) -> N
 
     # download
     download_command = [
-        "curl",
+        "wget",
         "-L",
         "-o",
         str(download_path),
