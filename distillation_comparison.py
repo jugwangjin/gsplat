@@ -13,7 +13,7 @@ def main():
 
     BASIC_output_dir_name = 'bicycle_4'
 
-    sh_coeffs_mults = [4, 8, 16]
+    sh_coeffs_mults = [2, 4, 8]
 
     combinations = []
 
