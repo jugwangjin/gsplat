@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
 import torch
 import torch.distributed
@@ -43,7 +43,7 @@ def rasterization(
     packed: bool = True,
     tile_size: int = 16,
     backgrounds: Optional[Tensor] = None,
-    render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
+    render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW", "F"] = "RGB",
     sparse_grad: bool = False,
     absgrad: bool = False,
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
@@ -222,7 +222,6 @@ def rasterization(
 
     """
     meta = {}
-
     N = means.shape[0]
     C = viewmats.shape[0]
     device = means.device
@@ -239,7 +238,7 @@ def rasterization(
     assert opacities.shape == (N,), opacities.shape
     assert viewmats.shape == (C, 4, 4), viewmats.shape
     assert Ks.shape == (C, 3, 3), Ks.shape
-    assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
+    assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW", "F"], render_mode
 
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(
@@ -292,7 +291,6 @@ def rasterization(
 
         # Silently change C from local #Cameras to global #Cameras.
         C = len(viewmats)
-
     # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
     proj_results = fully_fused_projection(
         means,
@@ -347,6 +345,8 @@ def rasterization(
             "opacities": opacities,
         }
     )
+
+    sh_coeffs = colors.reshape(N, -1).unsqueeze(0).repeat(C, 1, 1)  
 
     # Turn colors into [C, N, D] or [nnz, D] to pass into rasterize_to_pixels()
     if sh_degree is None:
@@ -476,9 +476,16 @@ def rasterization(
             conics = reshape_view(C, conics, N_world)
             opacities = reshape_view(C, opacities, N_world)
             colors = reshape_view(C, colors, N_world)
-
     # Rasterize to pixels
-    if render_mode in ["RGB+D", "RGB+ED"]:
+    if render_mode in ["F"]:
+        # colors would be all the features of Gaussians, including colors, normals, and depths
+        rgbs = colors # shape of N, 3
+
+        quats = quats.unsqueeze(0).repeat(C, 1, 1) # shape of N, 4
+        colors = torch.cat((rgbs, quats, sh_coeffs, depths[..., None]), dim=-1) # shape of N, 3+4+1+3+k*3+1, 
+
+
+    elif render_mode in ["RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW"]:
         colors = torch.cat((colors, depths[..., None]), dim=-1)
         if backgrounds is not None:
             backgrounds = torch.cat(
@@ -506,6 +513,12 @@ def rasterization(
         camera_ids=camera_ids,
         gaussian_ids=gaussian_ids,
     )
+    
+    first_32_bits = isect_ids >> 32
+    isect_cam_and_tile_id = first_32_bits.int()
+    unique_isect_ids, unique_isect_counts = torch.unique(isect_cam_and_tile_id, return_counts=True)
+    # print(tile_width, tile_height, tiles_per_gauss, isect_ids, flatten_ids)
+    # print(unique_isect_ids, unique_isect_counts.min(), unique_isect_counts.max())
     # print("rank", world_rank, "Before isect_offset_encode")
     isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
 
@@ -523,12 +536,12 @@ def rasterization(
             "n_cameras": C,
         }
     )
-
     # print("rank", world_rank, "Before rasterize_to_pixels")
     if colors.shape[-1] > channel_chunk:
         # slice into chunks
         n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
         render_colors, render_alphas = [], []
+        max_ids, max_weights = [], []
         for i in range(n_chunks):
             colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
             backgrounds_chunk = (
@@ -536,7 +549,7 @@ def rasterization(
                 if backgrounds is not None
                 else None
             )
-            render_colors_, render_alphas_ = rasterize_to_pixels(
+            render_colors_, render_alphas_, max_ids_, max_weights_ = rasterize_to_pixels(
                 means2d,
                 conics,
                 colors_chunk,
@@ -552,10 +565,14 @@ def rasterization(
             )
             render_colors.append(render_colors_)
             render_alphas.append(render_alphas_)
+            max_ids.append(max_ids_)
+            max_weights.append(max_weights_)
         render_colors = torch.cat(render_colors, dim=-1)
         render_alphas = render_alphas[0]  # discard the rest
+        max_ids = max_ids[0] # discard the rest
+        max_weights = max_weights[0] # discard the rest
     else:
-        render_colors, render_alphas = rasterize_to_pixels(
+        render_colors, render_alphas, max_ids, max_weights = rasterize_to_pixels(
             means2d,
             conics,
             colors,
@@ -569,7 +586,8 @@ def rasterization(
             packed=packed,
             absgrad=absgrad,
         )
-    if render_mode in ["ED", "RGB+ED"]:
+
+    if render_mode in ["ED", "RGB+ED", "RGB+ED+IW", "F"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(
             [
@@ -577,6 +595,29 @@ def rasterization(
                 render_colors[..., -1:] / render_alphas.clamp(min=1e-10),
             ],
             dim=-1,
+        )
+
+    if render_mode in ["RGB+IW", "RGB+ED+IW", "RGB+D+IW", "F"]:
+        meta.update(
+            {
+                "tile_width": tile_width,
+                "tile_height": tile_height,
+                "tiles_per_gauss": tiles_per_gauss,
+                "isect_ids": isect_ids,
+                "flatten_ids": flatten_ids,
+                "isect_offsets": isect_offsets,
+                "width": width,
+                "height": height,
+                "tile_size": tile_size,
+                "n_cameras": C,
+                "max_ids": max_ids,
+                "max_weights": max_weights,
+                "means2d": means2d,
+                "radii": radii,
+                "rendered_sh_coeffs": sh_coeffs,
+                "depths": depths,   
+            }
+
         )
 
     return render_colors, render_alphas, meta
@@ -664,6 +705,7 @@ def _rasterization(
         far_plane=far_plane,
         calc_compensations=(rasterize_mode == "antialiased"),
     )
+
     opacities = opacities.repeat(C, 1)  # [C, N]
     camera_ids, gaussian_ids = None, None
 

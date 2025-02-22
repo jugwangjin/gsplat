@@ -180,6 +180,54 @@ def split(
             state[k] = torch.cat((v[rest], v_new))
 
 
+
+
+@torch.no_grad()
+def rescale(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    scale_bias: float,
+    revised_opacity: bool = False,
+):
+    """Inplace split the Gaussian with the given mask.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        mask: A boolean mask to split the Gaussians.
+        revised_opacity: Whether to use revised opacity formulation
+          from arXiv:2404.06109. Default: False.
+    """
+    device = mask.device
+    sel = torch.where(mask)[0]
+    rest = torch.where(~mask)[0]
+
+    scales = params["scales"][sel]
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        if name == "scales":
+            p = scales + scale_bias
+            p = torch.nn.Parameter(p, requires_grad=p.requires_grad)
+        return p
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v[sel] = 0
+        return v
+
+    names = ['scale']
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    # update the extra running state
+    if state is not None:
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v
+
+
+
 @torch.no_grad()
 def remove(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],

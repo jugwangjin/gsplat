@@ -9,7 +9,7 @@ from typing_extensions import Literal
 
 
 @dataclass
-class DefaultStrategy(Strategy):
+class Distill2DStrategy(Strategy):
     """A default strategy that follows the original 3DGS paper:
 
     `3D Gaussian Splatting for Real-Time Radiance Field Rendering <https://arxiv.org/abs/2308.04079>`_
@@ -84,14 +84,17 @@ class DefaultStrategy(Strategy):
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 500
-    refine_stop_iter: int = 15_000
-    reset_every: int = 3000
+    refine_stop_iter: int = 7_000
+    reset_every: int = 2500
     refine_every: int = 100
     pause_refine_after_reset: int = 0
     absgrad: bool = False
     revised_opacity: bool = False
     verbose: bool = False
-    key_for_gradient: Literal["means2d", "gradient_2dgs", "distill_losses"] = "means2d"
+    key_for_gradient: Literal["means2d", "gradient_2dgs", "quat", "sh_coeffs", "depths", "rendered_sh_coeffs","depths_and_sh"] = "means2d"
+
+    sh_coeffs_mult: float = 50
+    depths_mult: float = 10
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -144,10 +147,21 @@ class DefaultStrategy(Strategy):
         info: Dict[str, Any],
     ):
         """Callback function to be executed before the `loss.backward()` call."""
-        assert (
-            self.key_for_gradient in info
-        ), "The 2D means of the Gaussians is required but missing."
-        info[self.key_for_gradient].retain_grad()
+        if self.key_for_gradient == 'sh_coeffs':
+            pass 
+        elif self.key_for_gradient != 'depths_and_sh':
+            assert (
+                self.key_for_gradient in info
+            ), "The 2D means of the Gaussians is required but missing."
+            info[self.key_for_gradient].retain_grad()
+            info['means2d'].retain_grad()
+        else:
+            assert (
+                'rendered_sh_coeffs' in info and 'depths' in info
+            ), "The SH coefficients of the Gaussians is required but missing."
+            info['rendered_sh_coeffs'].retain_grad()
+            info['depths'].retain_grad()
+            info['means2d'].retain_grad()
 
     def step_post_backward(
         self,
@@ -207,51 +221,120 @@ class DefaultStrategy(Strategy):
         info: Dict[str, Any],
         packed: bool = False,
     ):
-        for key in [
-            "width",
-            "height",
-            "n_cameras",
-            "radii",
-            "gaussian_ids",
-            self.key_for_gradient,
-        ]:
-            assert key in info, f"{key} is required but missing."
+        if self.key_for_gradient == 'sh_coeffs':
+            for key in [
+                "width",
+                "height",
+                "n_cameras",
+                "radii",
+                "gaussian_ids",
+            ]:
+                assert key in info, f"{key} is required but missing."
+
+        elif self.key_for_gradient != 'depths_and_sh':
+            for key in [
+                "width",
+                "height",
+                "n_cameras",
+                "radii",
+                "gaussian_ids",
+                self.key_for_gradient,
+            ]:
+                assert key in info, f"{key} is required but missing."
+        else:
+            for key in [
+                "width",
+                "height",
+                "n_cameras",
+                "radii",
+                "rendered_sh_coeffs",
+                "depths",
+            ]:
+                assert key in info, f"{key} is required but missing."
 
         # normalize grads to [-1, 1] screen space
-        if self.absgrad:
-            grads = info[self.key_for_gradient].absgrad.clone()
-        else:
-            grads = info[self.key_for_gradient].grad.clone()
-        grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
-        grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
+        
+        if self.key_for_gradient != "sh_coeffs":
+            if self.key_for_gradient == "rendered_sh_coeffs":
+                grads = info[self.key_for_gradient].grad.clone().abs() * self.sh_coeffs_mult
+            elif self.key_for_gradient == "depths":
+                grads = info[self.key_for_gradient].grad.clone().abs() * self.depths_mult
+            elif self.key_for_gradient == "depths_and_sh":
+                sh_grads = info["rendered_sh_coeffs"].grad.clone().abs() * self.sh_coeffs_mult
+                depths_grads = info["depths"].grad.clone().abs() * self.depths_mult
+                
+                grads = torch.cat([sh_grads, depths_grads[..., None]], dim=-1)
+            else:
+                if self.absgrad:
+                    grads = info[self.key_for_gradient].absgrad.clone()
+                else:
+                    grads = info[self.key_for_gradient].grad.clone()
+                grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
+                grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
 
-        # initialize state on the first run
-        n_gaussian = len(list(params.values())[0])
+            # initialize state on the first run
+            n_gaussian = len(list(params.values())[0])
 
-        if state["grad2d"] is None:
-            state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
-        if state["count"] is None:
-            state["count"] = torch.zeros(n_gaussian, device=grads.device)
-        if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
-            assert "radii" in info, "radii is required but missing."
-            state["radii"] = torch.zeros(n_gaussian, device=grads.device)
 
-        # update the running state
-        if packed:
-            # grads is [nnz, 2]
-            gs_ids = info["gaussian_ids"]  # [nnz]
-            radii = info["radii"]  # [nnz]
-        else:
-            # grads is [C, N, 2]
-            sel = info["radii"] > 0.0  # [C, N]
-            gs_ids = torch.where(sel)[1]  # [nnz]
-            grads = grads[sel]  # [nnz, 2]
-            radii = info["radii"][sel]  # [nnz]
+            if state["grad2d"] is None:
+                state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
+            if state["count"] is None:
+                state["count"] = torch.zeros(n_gaussian, device=grads.device)
+            if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
+                assert "radii" in info, "radii is required but missing."
+                state["radii"] = torch.zeros(n_gaussian, device=grads.device)
 
-        state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
-        state["count"].index_add_(
-            0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
-        )
+            # update the running state
+            if packed:
+                # grads is [nnz, 2]
+                gs_ids = info["gaussian_ids"]  # [nnz]
+                radii = info["radii"]  # [nnz]
+            else:
+                # grads is [C, N, 2]
+                sel = info["radii"] > 0.0  # [C, N]
+                gs_ids = torch.where(sel)[1]  # [nnz]
+                grads = grads[sel]  # [nnz, 2]
+                radii = info["radii"][sel]  # [nnz]
+
+            state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
+
+            if self.key_for_gradient != "means2d":
+                means2d_grad = info["means2d"].grad.clone()
+                means2d_grad[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
+                means2d_grad[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
+                means2d_grad = means2d_grad * 0.1
+                if not packed:
+                    means2d_grad = means2d_grad[sel]
+                state["grad2d"].index_add_(0, gs_ids, means2d_grad.norm(dim=-1))
+
+
+            state["count"].index_add_(
+                0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
+            )
+
+        elif self.key_for_gradient == "sh_coeffs":
+            n_gaussian = len(list(params.values())[0])
+            sh0_grads = params['sh0'].grad.clone()
+            shN_grads = params['shN'].grad.clone()
+            sh_grads = torch.cat([sh0_grads.reshape(n_gaussian, -1), shN_grads(n_gaussian, -1)], dim=-1) * self.sh_coeffs_mult
+            sh_grads = sh_grads.norm(dim=-1)
+
+        
+            # initialize state on the first run
+            n_gaussian = len(list(params.values())[0])
+
+            if state["grad2d"] is None:
+                state["grad2d"] = torch.zeros(n_gaussian, device=sh_grads.device)
+            if state["count"] is None:
+                state["count"] = torch.zeros(n_gaussian, device=sh_grads.device)
+            if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
+                assert "radii" in info, "radii is required but missing."
+                state["radii"] = torch.zeros(n_gaussian, device=sh_grads.device)
+
+
+            state["grad2d"] += sh_grads
+            state["count"] += 1
+
         if self.refine_scale2d_stop_iter > 0:
             # Should be ideally using scatter max
             state["radii"][gs_ids] = torch.maximum(

@@ -105,7 +105,7 @@ except ImportError:
             os.remove(os.path.join(build_dir, "lock"))
         except OSError:
             pass
-
+        
         if os.path.exists(os.path.join(build_dir, "gsplat_cuda.so")) or os.path.exists(
             os.path.join(build_dir, "gsplat_cuda.lib")
         ):

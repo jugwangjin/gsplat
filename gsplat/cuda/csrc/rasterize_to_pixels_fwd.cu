@@ -33,7 +33,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     S *__restrict__ render_colors, // [C, image_height, image_width, COLOR_DIM]
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids // [C, image_height, image_width]
+    int32_t *__restrict__ last_ids, // [C, image_height, image_width]
+    int32_t *__restrict__ max_ids, // [C, image_height, image_width]
+    S *__restrict__ max_weights // [C, image_height, image_width]
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -45,10 +47,19 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     uint32_t i = block.group_index().y * tile_size + block.thread_index().y;
     uint32_t j = block.group_index().z * tile_size + block.thread_index().x;
 
+    int32_t max_id;
+    S max_weight;
+
     tile_offsets += camera_id * tile_height * tile_width;
     render_colors += camera_id * image_height * image_width * COLOR_DIM;
     render_alphas += camera_id * image_height * image_width;
     last_ids += camera_id * image_height * image_width;
+    max_ids += camera_id * image_height * image_width;
+    max_weights += camera_id * image_height * image_width;
+
+    max_id = -1;
+    max_weight = 0.0f;
+
     if (backgrounds != nullptr) {
         backgrounds += camera_id * COLOR_DIM;
     }
@@ -72,6 +83,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             render_colors[pix_id * COLOR_DIM + k] =
                 backgrounds == nullptr ? 0.0f : backgrounds[k];
         }
+        max_ids[pix_id] = -1;
+        max_weights[pix_id] = 0.0f;
         return;
     }
 
@@ -160,6 +173,12 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             for (uint32_t k = 0; k < COLOR_DIM; ++k) {
                 pix_out[k] += c_ptr[k] * vis;
             }
+            
+            if (vis > max_weight) {
+                max_id = g;
+                max_weight = vis;
+            }
+
             cur_idx = batch_start + t;
 
             T = next_T;
@@ -179,13 +198,18 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                 backgrounds == nullptr ? pix_out[k]
                                        : (pix_out[k] + T * backgrounds[k]);
         }
+
         // index in bin of last gaussian in this pixel
         last_ids[pix_id] = static_cast<int32_t>(cur_idx);
+
+        // index of gaussian with max visibility in this pixel
+        max_ids[pix_id] = max_id;
+        max_weights[pix_id] = max_weight;
     }
 }
 
 template <uint32_t CDIM>
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,    // [C, N, 3] or [nnz, 3]
@@ -240,6 +264,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
         {C, image_height, image_width}, means2d.options().dtype(torch::kInt32)
     );
 
+    torch::Tensor max_ids = torch::empty(
+        {C, image_height, image_width, 1}, means2d.options().dtype(torch::kInt32)
+    );
+
+    torch::Tensor max_weights = torch::empty(
+        {C, image_height, image_width, 1}, means2d.options().dtype(torch::kFloat32)
+    );
+
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     const uint32_t shared_mem =
         tile_size * tile_size *
@@ -281,13 +313,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
             flatten_ids.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>()
+            last_ids.data_ptr<int32_t>(),
+            max_ids.data_ptr<int32_t>(),
+            max_weights.data_ptr<float>()
         );
 
-    return std::make_tuple(renders, alphas, last_ids);
+    return std::make_tuple(renders, alphas, last_ids, max_ids, max_weights);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_to_pixels_fwd_tensor(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
@@ -338,6 +372,7 @@ rasterize_to_pixels_fwd_tensor(
         __GS__CALL_(17)
         __GS__CALL_(32)
         __GS__CALL_(33)
+        __GS__CALL_(56)
         __GS__CALL_(64)
         __GS__CALL_(65)
         __GS__CALL_(128)
