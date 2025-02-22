@@ -33,7 +33,6 @@ def main():
 
     commands = []
 
-    commands.append("CUDA_VISIBLE_DEVICES=1 python teacher_trainer.py default --data_factor 4 --data_dir data/360_v2/bicycle --disable_viewer --result_dir gsplat_teachers/bicycle_4")
 
     for combination in combinations:
         distill_sh_lambda = combination[0]
@@ -202,6 +201,7 @@ def main():
             writer.writerow(complete_options)
 
 
+    commands.append("CUDA_VISIBLE_DEVICES=1 python teacher_trainer.py default --data_factor 4 --data_dir data/360_v2/bicycle --disable_viewer --result_dir gsplat_teachers/bicycle_4")
     print(len(commands))
     try:
         for command in commands:
