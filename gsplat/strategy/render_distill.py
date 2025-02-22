@@ -84,7 +84,7 @@ class Distill2DStrategy(Strategy):
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 500
-    refine_stop_iter: int = 7_000
+    refine_stop_iter: int = 5_000
     reset_every: int = 2500
     refine_every: int = 100
     pause_refine_after_reset: int = 0
