@@ -1,14 +1,11 @@
 import os
 import subprocess
 
-
 BASE_COMMAND = "CUDA_VISIBLE_DEVICES=1 python student_trainer.py distill2d --teacher_ckpt gsplat_teachers/bicycle_4/ckpts/ckpt_29999_rank0.pt --data_factor 4 --data_dir data/360_v2/bicycle/ --disable_viewer --strategy.grow_grad2d 0.0009 --apply_vis_on_teacher_sampling"
 STUDENT_DIR = "gsplat_students_v7"
 
 def main():
-
-
-    distill_lambda_keys = ['sh', 'colors', 'depth', 'quats']
+    distill_lambda_keys = ['sh', 'colors', 'depth', 'xyzs', 'quats']
     key_for_gradient = ['depths_and_sh', 'rendered_sh_coeffs', 'sh_coeffs', 'depths', ]
 
     BASIC_output_dir_name = 'bicycle_4'
@@ -17,33 +14,39 @@ def main():
 
     combinations = []
 
-    combinations.append([5e-1, 0, 5e-1, 0])
-    combinations.append([5e-1, 0, 0, 0])
-    combinations.append([0, 5e-1, 0, 0])
-    combinations.append([0, 0, 5e-1, 0])
-    combinations.append([0, 0, 0, 5e-1])
+    combinations.append([5e-1, 0, 5e-1, 0, 0])
+    combinations.append([5e-1, 0, 0, 0, 0])
+    combinations.append([0, 5e-1, 0, 0, 0])
+    combinations.append([0, 0, 5e-1, 0, 0])
+    combinations.append([0, 0, 0, 5e-1, 0])
+    combinations.append([0, 0, 0, 0, 5e-1])
 
-    combinations.append([1, 0, 1, 0])
-    combinations.append([1, 0, 0, 0])
-    combinations.append([0, 1, 0, 0])
-    combinations.append([0, 0, 1, 0])
-    combinations.append([0, 0, 0, 1])
+    combinations.append([1, 0, 1, 0, 0])
+    combinations.append([1, 0, 0, 0, 0])
+    combinations.append([0, 1, 0, 0, 0])
+    combinations.append([0, 0, 1, 0, 0])
+    combinations.append([0, 0, 0, 1, 0])
+    combinations.append([0, 0, 0, 0, 1])
 
     grow_grad2ds = [0.0002]
 
     commands = []
+    # Ensure teacher checkpoint exists, if not run teacher training.
     if not os.path.exists("gsplat_teachers/bicycle_4/ckpts/ckpt_29999_rank0.pt"):
         commands.append("CUDA_VISIBLE_DEVICES=1 python teacher_trainer.py default --data_factor 4 --data_dir data/360_v2/bicycle --disable_viewer --result_dir gsplat_teachers/bicycle_4")
 
     for combination in combinations:
+        # Extract all five lambda parameters.
         distill_sh_lambda = combination[0]
         distill_colors_lambda = combination[1]
         distill_depth_lambda = combination[2]
-        distill_quats_lambda = combination[3]
+        distill_xyzs_lambda = combination[3]
+        distill_quats_lambda = combination[4]
 
         base_command = BASE_COMMAND
         base_command += f' --distill_colors_lambda {distill_colors_lambda}'
         base_command += f' --distill_depth_lambda {distill_depth_lambda}'
+        base_command += f' --distill_xyzs_lambda {distill_xyzs_lambda}'
         base_command += f' --distill_quats_lambda {distill_quats_lambda}'
         base_command += f' --distill_sh_lambda {distill_sh_lambda}'
 
@@ -62,7 +65,7 @@ def main():
                         
                         output_dir_name = (
                             BASIC_output_dir_name +
-                            f'_sh{distill_sh_lambda}_colors{distill_colors_lambda}_depth{distill_depth_lambda}_quats{distill_quats_lambda}_'
+                            f'_sh{distill_sh_lambda}_colors{distill_colors_lambda}_depth{distill_depth_lambda}_xyzs{distill_xyzs_lambda}_quats{distill_quats_lambda}_'
                             f'{gradient_key}_sh{sh_mult}_depth{depth_mult}_grow2d{grow_grad2d}'
                         )
                         output_dir = os.path.join(STUDENT_DIR, output_dir_name)
@@ -80,7 +83,6 @@ def main():
                     continue
                 for sh_mult in sh_coeffs_mults:
                     for grow_grad2d in grow_grad2ds:
-
                         cmd = base_command
                         cmd += f' --strategy.sh_coeffs_mult {sh_mult}'
                         cmd += f' --strategy.key_for_gradient {gradient_key}'
@@ -88,10 +90,9 @@ def main():
 
                         output_dir_name = (
                             BASIC_output_dir_name +
-                            f'_sh{distill_sh_lambda}_colors{distill_colors_lambda}_depth{distill_depth_lambda}_quats{distill_quats_lambda}_'
+                            f'_sh{distill_sh_lambda}_colors{distill_colors_lambda}_depth{distill_depth_lambda}_xyzs{distill_xyzs_lambda}_quats{distill_quats_lambda}_'
                             f'{gradient_key}_sh{sh_mult}_grow2d{grow_grad2d}'
                         )
-                        
                         output_dir = os.path.join(STUDENT_DIR, output_dir_name)
                         cmd += f' --result_dir {output_dir}'
                         if os.path.exists(os.path.join(output_dir, 'ckpts', 'ckpt_9999_rank0.pt')):
@@ -105,7 +106,6 @@ def main():
                 if gradient_key in ['rendered_sh_coeffs', 'depths_and_sh']:
                     continue
                 for depth_mult in sh_coeffs_mults:
-                    depth_mult = depth_mult 
                     for grow_grad2d in grow_grad2ds:
                         cmd = base_command
                         cmd += f' --strategy.depths_mult {depth_mult}'
@@ -114,7 +114,7 @@ def main():
 
                         output_dir_name = (
                             BASIC_output_dir_name +
-                            f'_sh{distill_sh_lambda}_colors{distill_colors_lambda}_depth{distill_depth_lambda}_quats{distill_quats_lambda}_'
+                            f'_sh{distill_sh_lambda}_colors{distill_colors_lambda}_depth{distill_depth_lambda}_xyzs{distill_xyzs_lambda}_quats{distill_quats_lambda}_'
                             f'{gradient_key}_depth{depth_mult}_grow2d{grow_grad2d}'
                         )
                         output_dir = os.path.join(STUDENT_DIR, output_dir_name)
@@ -123,13 +123,12 @@ def main():
                             continue
                         commands.append(cmd)
 
-
         # Case 4: Both lambdas are zero -> produce one unified command (to avoid duplicates)
         else:
             cmd = base_command
             output_dir_name = (
                 BASIC_output_dir_name +
-                f'_sh{distill_sh_lambda}_colors{distill_colors_lambda}_depth{distill_depth_lambda}_quats{distill_quats_lambda}'
+                f'_sh{distill_sh_lambda}_colors{distill_colors_lambda}_depth{distill_depth_lambda}_xyzs{distill_xyzs_lambda}_quats{distill_quats_lambda}'
             )
             output_dir = os.path.join(STUDENT_DIR, output_dir_name)
             cmd += f' --result_dir {output_dir}'
@@ -137,18 +136,19 @@ def main():
                 continue
             commands.append(cmd)
 
-
-    # add gradient_key as 'means2d', no need for mults
-    combinations.append([0, 0, 0, 0])
+    # Add gradient_key as 'means2d', no need for mults.
+    combinations.append([0, 0, 0, 0, 0])
     for combination in combinations:        
         distill_sh_lambda = combination[0]
         distill_colors_lambda = combination[1]
         distill_depth_lambda = combination[2]
-        distill_quats_lambda = combination[3]
+        distill_xyzs_lambda = combination[3]
+        distill_quats_lambda = combination[4]
 
         base_command = BASE_COMMAND
         base_command += f' --distill_colors_lambda {distill_colors_lambda}'
         base_command += f' --distill_depth_lambda {distill_depth_lambda}'
+        base_command += f' --distill_xyzs_lambda {distill_xyzs_lambda}'
         base_command += f' --distill_quats_lambda {distill_quats_lambda}'
         base_command += f' --distill_sh_lambda {distill_sh_lambda}'
 
@@ -162,7 +162,7 @@ def main():
                 
                 output_dir_name = (
                     BASIC_output_dir_name +
-                    f'_sh{distill_sh_lambda}_colors{distill_colors_lambda}_depth{distill_depth_lambda}_quats{distill_quats_lambda}_'
+                    f'_sh{distill_sh_lambda}_colors{distill_colors_lambda}_depth{distill_depth_lambda}_xyzs{distill_xyzs_lambda}_quats{distill_quats_lambda}_'
                     f'{gradient_key}_grow2d{grow_grad2d}'
                 )
                 output_dir = os.path.join(STUDENT_DIR, output_dir_name)
@@ -171,10 +171,8 @@ def main():
                     continue
                 commands.append(cmd)
 
-    # parse commands, extract all options, save as csv file
-
+    # Parse commands, extract all options, and save as a CSV file.
     import csv
-    # Step 1: Collect all possible keys
     all_keys = set()
     parsed_commands = []
 
@@ -191,16 +189,13 @@ def main():
 
         parsed_commands.append(options)
 
-    # Step 2: Write to CSV with all keys
     csv_filename = 'distillation_options.csv'
     with open(csv_filename, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=sorted(all_keys))  # Ensure consistent columns
+        writer = csv.DictWriter(f, fieldnames=sorted(all_keys))
         writer.writeheader()
         for options in parsed_commands:
-            # Fill in missing keys with an empty string
             complete_options = {key: options.get(key, "") for key in all_keys}
             writer.writerow(complete_options)
-
 
     print(len(commands))
     try:
@@ -213,7 +208,6 @@ def main():
         print(e)
 
     return
-
 
 if __name__ == "__main__":
     main()

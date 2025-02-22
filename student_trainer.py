@@ -173,6 +173,7 @@ class Config:
 
     distill_colors_lambda: float = 1e-1
     distill_depth_lambda: float = 1e-1
+    distill_xyzs_lambda: float = 1e-1    
     distill_quats_lambda: float = 1e-1    
     distill_sh_lambda: float = 1e-1
     distill_sh0_lambda: float = 1e-1
@@ -594,6 +595,7 @@ class Runner:
 
         cfg.distill = cfg.distill_colors_lambda > 0.0 or \
                         cfg.distill_depth_lambda > 0.0 or \
+                        cfg.distill_xyzs_lambda > 0.0 or \
                         cfg.distill_quats_lambda > 0.0 or \
                         cfg.distill_sh_lambda > 0.0 
                         # cfg.distill_sh0_lambda > 0.0 or \
@@ -766,8 +768,9 @@ class Runner:
                         splats = self.teacher_splats
                     )
                     teacher_rgb = teacher_renders[..., 0:3].detach().data # [1, H, W, 3]
-                    teacher_quats = teacher_renders[..., 3:7].detach().data # [1, H, W, 4]
-                    teacher_sh = teacher_renders[..., 7:-1].detach().data # [1, H, W, 3]
+                    teacher_xyzs = teacher_renders[..., 3:6].detach().data # [1, H, W, 3]
+                    teacher_quats = teacher_renders[..., 6:10].detach().data # [1, H, W, 4]
+                    teacher_sh = teacher_renders[..., 10:-1].detach().data # [1, H, W, k*3]
                     # teacher_sh0 = teacher_renders[..., 7:10].detach().data # [1, H, W, 3]
                     # teacher_shN = teacher_renders[..., 10:-1].detach().data # [1, H, W, k*3]
                     teacher_depths = teacher_renders[..., -1:].detach().data # [1, H, W, 1]
@@ -792,8 +795,9 @@ class Runner:
             colors = renders[..., 0:3]
             depths = renders[..., -1:] if renders.shape[-1] > 3 else None
             if cfg.distill:
-                quats = renders[..., 3:7]
-                sh = renders[..., 7:-1]
+                xyzs = renders[..., 3:6]
+                quats = renders[..., 6:10]
+                sh = renders[..., 10:-1]
                 # sh0 = renders[..., 7:10]
                 # shN = renders[..., 10:-1]
             
@@ -829,6 +833,9 @@ class Runner:
             if cfg.distill:
                 colorloss = F.l1_loss(colors, teacher_rgb) * cfg.distill_colors_lambda
                 loss += colorloss
+
+                xyzloss = F.l1_loss(xyzs, teacher_xyzs) * cfg.distill_xyzs_lambda * self.scene_scale
+                loss += xyzloss
 
                 depthloss = F.l1_loss(depths, teacher_depths) * cfg.distill_depth_lambda * self.scene_scale
                 loss += depthloss
@@ -875,6 +882,8 @@ class Runner:
                     desc += f"colorloss={colorloss.item():.3f}| "
                 if cfg.distill_depth_lambda > 0.0:
                     desc += f"depthloss={depthloss.item():.3f}| "
+                if cfg.distill_xyzs_lambda > 0.0:
+                    desc += f"xyzloss={xyzloss.item():.3f}| "
                 if cfg.distill_quats_lambda > 0.0:
                     desc += f"quatloss={quatloss.item():.3f}| "
                 if cfg.distill_sh_lambda > 0.0:

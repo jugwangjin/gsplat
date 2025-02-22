@@ -475,6 +475,7 @@ rasterize_to_pixels_bwd_tensor(
         __GS__CALL_(32)
         __GS__CALL_(33)
         __GS__CALL_(56)
+        __GS__CALL_(59)
         __GS__CALL_(64)
         __GS__CALL_(65)
         __GS__CALL_(128)
