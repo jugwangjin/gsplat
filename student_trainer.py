@@ -50,9 +50,11 @@ class Config:
     # Disable viewer
     disable_viewer: bool = False
     # Path to the teacher's .pt files. With this, student is initialized with the teacher's GSs and gets supervised from teacher's depths.
+    original_initialization: bool = False
+    use_novel_view: bool = False
     teacher_ckpt: str = None
     # The teacher's sampling ratio. If 0.1, the 10% of the teacher's GSs are used for the student.
-    teacher_sampling_ratio: float = 0.02
+    teacher_sampling_ratio: float = 0.01
     # disable the reinitialization by expected depth, instead, use the xyz of the teacher's GSs.
     disable_depth_reinit: bool = False
     # 
@@ -89,17 +91,18 @@ class Config:
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
 
+
     # Number of training steps
-    max_steps: int = 10_000
-    # max_steps: int = 30_000
+    max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [500, 5_000, 10_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [10_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [10_000])
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -210,6 +213,92 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
+
+
+def create_splats_with_optimizers_original(
+    parser: Parser,
+    init_type: str = "sfm",
+    init_num_pts: int = 100_000,
+    init_extent: float = 3.0,
+    init_opacity: float = 0.1,
+    init_scale: float = 1.0,
+    scene_scale: float = 1.0,
+    sh_degree: int = 3,
+    sparse_grad: bool = False,
+    visible_adam: bool = False,
+    batch_size: int = 1,
+    feature_dim: Optional[int] = None,
+    device: str = "cuda",
+    world_rank: int = 0,
+    world_size: int = 1,
+) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
+    if init_type == "sfm":
+        points = torch.from_numpy(parser.points).float()
+        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+    elif init_type == "random":
+        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+        rgbs = torch.rand((init_num_pts, 3))
+    else:
+        raise ValueError("Please specify a correct init_type: sfm or random")
+
+    # Initialize the GS size to be the average dist of the 3 nearest neighbors
+    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    dist_avg = torch.sqrt(dist2_avg)
+    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+
+    # Distribute the GSs to different ranks (also works for single rank)
+    points = points[world_rank::world_size]
+    rgbs = rgbs[world_rank::world_size]
+    scales = scales[world_rank::world_size]
+
+    N = points.shape[0]
+    quats = torch.rand((N, 4))  # [N, 4]
+    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+
+    params = [
+        # name, value, lr
+        ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
+        ("scales", torch.nn.Parameter(scales), 5e-3),
+        ("quats", torch.nn.Parameter(quats), 1e-3),
+        ("opacities", torch.nn.Parameter(opacities), 5e-2),
+    ]
+
+    if feature_dim is None:
+        # color is SH coefficients.
+        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+        colors[:, 0, :] = rgb_to_sh(rgbs)
+        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
+        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20))
+    else:
+        # features will be used for appearance and view-dependent shading
+        features = torch.rand(N, feature_dim)  # [N, feature_dim]
+        params.append(("features", torch.nn.Parameter(features), 2.5e-3))
+        colors = torch.logit(rgbs)  # [N, 3]
+        params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
+
+    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
+    # Scale learning rate based on batch size, reference:
+    # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
+    # Note that this would not make the training exactly equivalent, see
+    # https://arxiv.org/pdf/2402.18824v1
+    BS = batch_size * world_size
+    optimizer_class = None
+    if sparse_grad:
+        optimizer_class = torch.optim.SparseAdam
+    elif visible_adam:
+        optimizer_class = SelectiveAdam
+    else:
+        optimizer_class = torch.optim.Adam
+    optimizers = {
+        name: optimizer_class(
+            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+            eps=1e-15 / math.sqrt(BS),
+            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+        )
+        for name, _, lr in params
+    }
+    return splats, optimizers
 
 @torch.no_grad()
 def create_splats_with_optimizers(
@@ -449,6 +538,18 @@ class Runner:
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
         )
+
+
+
+
+
+
+
+
+
+
+
+
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
@@ -463,26 +564,46 @@ class Runner:
             self.teacher_splats[k] = teacher_ckpt["splats"][k].to(self.device).data
 
 
-        self.splats, self.optimizers = create_splats_with_optimizers(
-            self.parser,
-            trainset=self.trainset,
-            cfg=cfg,
-            runner=self,
-            init_type=cfg.init_type,
-            init_num_pts=cfg.init_num_pts,
-            init_extent=cfg.init_extent,
-            init_opacity=cfg.init_opa,
-            init_scale=cfg.init_scale,
-            scene_scale=self.scene_scale,
-            sh_degree=cfg.sh_degree,
-            sparse_grad=cfg.sparse_grad,
-            visible_adam=cfg.visible_adam,
-            batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
-            device=self.device,
-            world_rank=world_rank,
-            world_size=world_size,
-        )
+        if cfg.original_initialization:
+            feature_dim = 32 if cfg.app_opt else None
+            self.splats, self.optimizers = create_splats_with_optimizers_original(
+                self.parser,
+                init_type=cfg.init_type,
+                init_num_pts=cfg.init_num_pts,
+                init_extent=cfg.init_extent,
+                init_opacity=cfg.init_opa,
+                init_scale=cfg.init_scale,
+                scene_scale=self.scene_scale,
+                sh_degree=cfg.sh_degree,
+                sparse_grad=cfg.sparse_grad,
+                visible_adam=cfg.visible_adam,
+                batch_size=cfg.batch_size,
+                feature_dim=feature_dim,
+                device=self.device,
+                world_rank=world_rank,
+                world_size=world_size,
+            )
+        else:
+            self.splats, self.optimizers = create_splats_with_optimizers(
+                self.parser,
+                trainset=self.trainset,
+                cfg=cfg,
+                runner=self,
+                init_type=cfg.init_type,
+                init_num_pts=cfg.init_num_pts,
+                init_extent=cfg.init_extent,
+                init_opacity=cfg.init_opa,
+                init_scale=cfg.init_scale,
+                scene_scale=self.scene_scale,
+                sh_degree=cfg.sh_degree,
+                sparse_grad=cfg.sparse_grad,
+                visible_adam=cfg.visible_adam,
+                batch_size=cfg.batch_size,
+                feature_dim=feature_dim,
+                device=self.device,
+                world_rank=world_rank,
+                world_size=world_size,
+            )
         
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -724,6 +845,7 @@ class Runner:
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
+            novel_view = False
 
             try:
                 data = next(trainloader_iter)
@@ -751,31 +873,40 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
-            if cfg.distill:
+            if cfg.use_novel_view and torch.rand(1) < 0.2:
+                data = self.trainset.sample_novel_views(batch_size=cfg.batch_size)
+                Ks = data["K"].to(device)  # [1, 3, 3]
+                camtoworlds = data["camtoworld"].to(device)
 
-                with torch.no_grad():
-                    teacher_renders, _, _ = self.rasterize_splats(
-                        camtoworlds=camtoworlds_gt,
-                        Ks=Ks,
-                        width=width,
-                        height=height,
-                        sh_degree=sh_degree_to_use,
-                        near_plane=cfg.near_plane,
-                        far_plane=cfg.far_plane,
-                        image_ids=image_ids,
-                        render_mode="F",
-                        masks=masks,
-                        splats = self.teacher_splats
-                    )
-                    teacher_rgb = teacher_renders[..., 0:3].detach().data # [1, H, W, 3]
-                    teacher_xyzs = teacher_renders[..., 3:6].detach().data # [1, H, W, 3]
-                    teacher_quats = teacher_renders[..., 6:10].detach().data # [1, H, W, 4]
-                    teacher_sh = teacher_renders[..., 10:-1].detach().data # [1, H, W, k*3]
-                    # teacher_sh0 = teacher_renders[..., 7:10].detach().data # [1, H, W, 3]
-                    # teacher_shN = teacher_renders[..., 10:-1].detach().data # [1, H, W, k*3]
-                    teacher_depths = teacher_renders[..., -1:].detach().data # [1, H, W, 1]
+                novel_view = True
 
-                    del teacher_renders
+            with torch.no_grad():
+                teacher_renders, _, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds_gt,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree_to_use,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    image_ids=image_ids,
+                    render_mode="F",
+                    masks=masks,
+                    splats = self.teacher_splats
+                )
+                teacher_rgb = teacher_renders[..., 0:3].detach().data # [1, H, W, 3]
+                teacher_xyzs = teacher_renders[..., 3:6].detach().data # [1, H, W, 3]
+                teacher_quats = teacher_renders[..., 6:10].detach().data # [1, H, W, 4]
+                teacher_sh = teacher_renders[..., 10:-1].detach().data # [1, H, W, k*3]
+                # teacher_sh0 = teacher_renders[..., 7:10].detach().data # [1, H, W, 3]
+                # teacher_shN = teacher_renders[..., 10:-1].detach().data # [1, H, W, k*3]
+                teacher_depths = teacher_renders[..., -1:].detach().data # [1, H, W, 1]
+
+                if novel_view:
+                    pixels = teacher_rgb
+
+                del teacher_renders
+
 
             # forward
             renders, alphas, info = self.rasterize_splats(
@@ -790,7 +921,6 @@ class Runner:
                 render_mode="F" if cfg.distill else "RGB+ED",
                 masks=masks,
             )
-
 
             colors = renders[..., 0:3]
             depths = renders[..., -1:] if renders.shape[-1] > 3 else None
@@ -823,13 +953,14 @@ class Runner:
                 info=info,
             )
 
+
+
             # loss
             l1loss = F.l1_loss(colors, pixels)
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-
             if cfg.distill:
                 colorloss = F.l1_loss(colors, teacher_rgb) * cfg.distill_colors_lambda
                 loss += colorloss
@@ -1368,3 +1499,163 @@ if __name__ == "__main__":
             )
 
     cli(main, cfg, verbose=True)
+
+
+
+
+
+
+
+
+
+    '''
+    testing training views
+    '''
+
+    # import open3d as o3d
+    # def create_camera_visualization(*args, **kwargs) -> o3d.geometry.LineSet:
+    #     """
+    #     Overloaded factory function to create a camera visualization LineSet from intrinsic and extrinsic camera matrices.
+
+    #     Overload 1:
+    #     create_camera_visualization(view_width_px: int, view_height_px: int, intrinsic: np.ndarray, extrinsic: np.ndarray, scale: float = 1.0)
+        
+    #     Overload 2:
+    #     create_camera_visualization(intrinsic: o3d.camera.PinholeCameraIntrinsic, extrinsic: np.ndarray, scale: float = 1.0)
+    #     """
+    #     # Overload 1: arguments: int, int, np.ndarray, np.ndarray, (optional scale)
+    #     if len(args) >= 4 and isinstance(args[0], int):
+    #         view_width_px, view_height_px, intrinsic, extrinsic = args[:4]
+    #         scale = kwargs.get("scale", 1.0)
+    #         # Convert the provided intrinsic matrix to an Open3D pinhole intrinsic.
+    #         fx = intrinsic[0, 0]
+    #         fy = intrinsic[1, 1]
+    #         cx = intrinsic[0, 2]
+    #         cy = intrinsic[1, 2]
+    #         pinhole = o3d.camera.PinholeCameraIntrinsic(view_width_px, view_height_px, fx, fy, cx, cy)
+    #         # Call the second overload.
+    #         return create_camera_visualization(pinhole, extrinsic, scale=scale)
+        
+    #     # Overload 2: arguments: o3d.camera.PinholeCameraIntrinsic, np.ndarray, (optional scale)
+    #     elif len(args) >= 2 and isinstance(args[0], o3d.camera.PinholeCameraIntrinsic):
+    #         intrinsic_obj = args[0]
+    #         extrinsic = args[1]
+    #         scale = kwargs.get("scale", 1.0)
+    #         # Define a canonical camera frustum in camera space.
+    #         # Here we use five points: the camera center and four corners at a given distance.
+    #         s = scale
+    #         points = np.array([
+    #             [0, 0, 0],             # camera center
+    #             [-s, -s, 1.5 * s],      # bottom-left
+    #             [ s, -s, 1.5 * s],      # bottom-right
+    #             [ s,  s, 1.5 * s],      # top-right
+    #             [-s,  s, 1.5 * s]       # top-left
+    #         ])
+    #         lines = [
+    #             [0, 1], [0, 2], [0, 3], [0, 4],
+    #             [1, 2], [2, 3], [3, 4], [4, 1]
+    #         ]
+    #         # Transform the canonical frustum from camera to world coordinates.
+    #         num_points = points.shape[0]
+    #         homogeneous_points = np.hstack([points, np.ones((num_points, 1))])
+    #         transformed_points = (extrinsic @ homogeneous_points.T).T[:, :3]
+    #         ls = o3d.geometry.LineSet()
+    #         ls.points = o3d.utility.Vector3dVector(transformed_points)
+    #         ls.lines = o3d.utility.Vector2iVector(lines)
+    #         return ls
+    #     else:
+    #         raise ValueError("Invalid arguments provided to create_camera_visualization")
+
+
+    # # ------------------------------------------------------------------------------
+    # # Assume that 'self.trainset' is already created and initialized as in your code.
+    # # ------------------------------------------------------------------------------
+    # # 1. Visualize all training views as green LineSets.
+    # train_linesets = []
+    # for idx in self.trainset.indices:
+    #     extrinsic = self.trainset.parser.camtoworlds[idx]   # 4x4 camera-to-world matrix.
+    #     camera_id = self.trainset.parser.camera_ids[idx]
+    #     intrinsic_np = self.trainset.parser.Ks_dict[camera_id]  # numpy intrinsic matrix.
+    #     view_width, view_height = self.trainset.parser.imsize_dict[camera_id]
+    #     # Create a camera frustum using the first overload.
+    #     ls = create_camera_visualization(view_width, view_height, intrinsic_np, extrinsic, scale=0.1)
+    #     # Color all lines green.
+    #     num_lines = np.asarray(ls.lines).shape[0]
+    #     ls.colors = o3d.utility.Vector3dVector(np.tile([0, 1, 0], (num_lines, 1)))
+    #     train_linesets.append(ls)
+
+    # # Merge all training view LineSets into a single LineSet.
+    # combined_train_points = []
+    # combined_train_lines = []
+    # offset = 0
+    # for ls in train_linesets:
+    #     pts = np.asarray(ls.points)
+    #     lines = np.asarray(ls.lines)
+    #     combined_train_points.append(pts)
+    #     combined_train_lines.append(lines + offset)
+    #     offset += pts.shape[0]
+    # combined_train_points = np.vstack(combined_train_points)
+    # combined_train_lines = np.vstack(combined_train_lines)
+    # train_lineset = o3d.geometry.LineSet()
+    # train_lineset.points = o3d.utility.Vector3dVector(combined_train_points)
+    # train_lineset.lines = o3d.utility.Vector2iVector(combined_train_lines)
+    # num_lines = combined_train_lines.shape[0]
+    # train_lineset.colors = o3d.utility.Vector3dVector(np.tile([0, 1, 0], (num_lines, 1)))
+
+    # o3d.io.write_line_set("train_view_visualization.ply", train_lineset)
+
+    # # 2. Sample 100 novel views and visualize them as red LineSets.
+    # novel_views = self.trainset.sample_novel_views(batch_size=100)
+    # novel_poses = novel_views["camtoworld"].numpy()  # shape: (100, 4, 4)
+    # # For simplicity, we use the intrinsic of the first training camera for all novel views.
+    # first_camera_id = self.trainset.parser.camera_ids[self.trainset.indices[0]]
+    # intrinsic_np = self.trainset.parser.Ks_dict[first_camera_id]
+    # view_width, view_height = self.trainset.parser.imsize_dict[first_camera_id]
+    # novel_linesets = []
+    # for extrinsic in novel_poses:
+    #     ls = create_camera_visualization(view_width, view_height, intrinsic_np, extrinsic, scale=0.1)
+    #     num_lines = np.asarray(ls.lines).shape[0]
+    #     ls.colors = o3d.utility.Vector3dVector(np.tile([1, 0, 0], (num_lines, 1)))
+    #     novel_linesets.append(ls)
+
+    # # Merge all novel view LineSets.
+    # combined_novel_points = []
+    # combined_novel_lines = []
+    # offset = 0
+    # for ls in novel_linesets:
+    #     pts = np.asarray(ls.points)
+    #     lines = np.asarray(ls.lines)
+    #     combined_novel_points.append(pts)
+    #     combined_novel_lines.append(lines + offset)
+    #     offset += pts.shape[0]
+    # combined_novel_points = np.vstack(combined_novel_points)
+    # combined_novel_lines = np.vstack(combined_novel_lines)
+    # novel_lineset = o3d.geometry.LineSet()
+    # novel_lineset.points = o3d.utility.Vector3dVector(combined_novel_points)
+    # novel_lineset.lines = o3d.utility.Vector2iVector(combined_novel_lines)
+    # num_lines = combined_novel_lines.shape[0]
+    # novel_lineset.colors = o3d.utility.Vector3dVector(np.tile([1, 0, 0], (num_lines, 1)))
+
+    # o3d.io.write_line_set("novel_view_visualization.ply", novel_lineset)
+
+    # # 3. Combine training and novel view LineSets.
+    # train_pts = np.asarray(train_lineset.points)
+    # novel_pts = np.asarray(novel_lineset.points)
+    # combined_points = np.vstack([train_pts, novel_pts])
+    # train_lines = np.asarray(train_lineset.lines)
+    # novel_lines = np.asarray(novel_lineset.lines) + train_pts.shape[0]  # offset for novel indices.
+    # combined_lines = np.vstack([train_lines, novel_lines])
+    # combined_colors = np.vstack([np.asarray(train_lineset.colors), np.asarray(novel_lineset.colors)])
+
+    # combined_lineset = o3d.geometry.LineSet()
+    # combined_lineset.points = o3d.utility.Vector3dVector(combined_points)
+    # combined_lineset.lines = o3d.utility.Vector2iVector(combined_lines)
+    # combined_lineset.colors = o3d.utility.Vector3dVector(combined_colors)
+
+    # # 4. Save the combined visualization as an OBJ file.
+    # # Note: OBJ format may have limited support for lines. If you run into issues, consider saving as a PLY.
+    # # o3d.io.write_line_set("novel_view_visualization.ply", combined_lineset)
+
+
+
+    # exit()

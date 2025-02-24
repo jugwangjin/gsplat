@@ -18,6 +18,8 @@ from .normalize import (
     transform_points,
 )
 
+from .traj import generate_interpolated_path
+from scipy.spatial import KDTree
 
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
@@ -352,6 +354,14 @@ class Dataset:
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
 
+        
+        # Precompute training camera centers and build a KDTree for training indices.
+        all_centers = self.parser.camtoworlds[:, :3, 3]
+        self.training_indices = self.indices  # training indices
+        self.training_centers = all_centers[self.training_indices]
+        self.training_kd_tree = KDTree(self.training_centers)
+
+
     def __len__(self):
         return len(self.indices)
 
@@ -421,6 +431,117 @@ class Dataset:
 
         return data
     
+    def sample_novel_view(
+            self,
+            keyframe_indices: Optional[List[int]] = None,
+            n_interp: int = 100,
+            spline_degree: int = 2,
+            smoothness: float = 0.03,
+            rot_weight: float = 0.1,
+        ) -> Dict[str, Any]:
+        """
+        Samples a novel view by interpolating between three training views.
+        Modified to choose keyframes from spatially close neighbors.
+        """
+
+        
+        if keyframe_indices is None:
+            # Choose a seed index from training images.
+            seed_index = np.random.choice(self.indices)
+            # Query KDTree for nearest neighbors among training cameras.
+            # k=5 gives a few neighbors; adjust if needed.
+            k = 5
+            distances, nn_local_idx = self.training_kd_tree.query(
+                self.parser.camtoworlds[seed_index, :3, 3], k=k
+            )
+            # Map KDTree indices back to the original indices.
+            nn_global = [self.training_indices[i] for i in nn_local_idx if self.training_indices[i] != seed_index]
+            # If there are fewer than 2 neighbors, fall back to random sampling.
+            if len(nn_global) < 2:
+                additional = np.random.choice(list(set(self.indices) - {seed_index}), size=2, replace=False)
+                keyframe_indices = np.sort([seed_index] + additional.tolist())
+            else:
+                # Randomly select 2 neighbors from the nearest neighbors.
+                keyframe_indices = np.sort([seed_index] + list(np.random.choice(nn_global, size=2, replace=False)))
+        else:
+            keyframe_indices = np.sort(keyframe_indices)
+        
+        # Get the corresponding 3x4 poses from the parser.
+        keyframe_poses = self.parser.camtoworlds[keyframe_indices, :3, :]  # shape (3, 3, 4)
+        
+        # Interpolate between the keyframes.
+        interpolated_poses = generate_interpolated_path(
+            keyframe_poses, n_interp=n_interp, spline_degree=spline_degree,
+            smoothness=smoothness, rot_weight=rot_weight
+        )
+        
+        # Randomly select one pose from the interpolated path.
+        random_idx = np.random.randint(interpolated_poses.shape[0])
+        novel_pose_3x4 = interpolated_poses[random_idx]
+        
+        # Convert the 3x4 pose to a full 4x4 matrix.
+        bottom = np.array([[0, 0, 0, 1]], dtype=novel_pose_3x4.dtype)
+        novel_pose_4x4 = np.concatenate([novel_pose_3x4, bottom], axis=0)
+        
+        # Use the intrinsics of the first keyframe (assuming similar intrinsics).
+        camera_id = self.parser.camera_ids[keyframe_indices[0]]
+        K = self.parser.Ks_dict[camera_id].copy()
+        
+        return {
+            "camtoworld": torch.from_numpy(novel_pose_4x4).float(),
+            "K": torch.from_numpy(K).float(),
+            "image_id": len(self)  # Unique id based on dataset length.
+        }
+
+    def sample_novel_views(
+        self,
+        batch_size: int = 1,
+        keyframe_indices: Optional[List[int]] = None,
+        n_interp: int = 100,
+        spline_degree: int = 2,
+        smoothness: float = 0.03,
+        rot_weight: float = 0.1,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Samples a batch of novel views by interpolating between three training views.
+
+        Args:
+            batch_size: Number of novel view samples to generate.
+            keyframe_indices: Optional list of three indices (from self.indices) to use as keyframes.
+                            If None, each sample will choose three random training indices.
+            n_interp: Number of interpolation steps between each pair of keyframes.
+            spline_degree: Degree of the B-spline.
+            smoothness: Spline smoothing parameter (0 forces exact interpolation).
+            rot_weight: Weight used to convert rotation to translation.
+
+        Returns:
+            A dictionary containing:
+            - "camtoworld": Tensor of shape (batch_size, 4, 4) with novel camera poses.
+            - "K": Tensor of shape (batch_size, 3, 3) for the intrinsics.
+            - "image_id": Tensor of shape (batch_size,) with unique image identifiers.
+        """
+        camtoworlds_list = []
+        K_list = []
+        image_ids = []
+        for i in range(batch_size):
+            sample = self.sample_novel_view(
+                keyframe_indices=keyframe_indices,
+                n_interp=n_interp,
+                spline_degree=spline_degree,
+                smoothness=smoothness,
+                rot_weight=rot_weight,
+            )
+            camtoworlds_list.append(sample["camtoworld"])
+            K_list.append(sample["K"])
+            # Use len(self) + i so that each novel view gets a unique image_id.
+            image_ids.append(len(self) + i)
+        return {
+            "camtoworld": torch.stack(camtoworlds_list, dim=0),
+            "K": torch.stack(K_list, dim=0),
+            "image_id": torch.tensor(image_ids),
+        }
+
+
 
 
 
