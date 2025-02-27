@@ -35,7 +35,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids, // [C, image_height, image_width]
     int32_t *__restrict__ max_ids, // [C, image_height, image_width]
-    S *__restrict__ max_weights // [C, image_height, image_width]
+    S *__restrict__ accumulated_weights_value, // [C, N]
+    int32_t *__restrict__ accumulated_weights_count, // [C, N]
+    S *__restrict__ max_weight_depths // [C, image_height, image_width, 1]
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -49,16 +51,19 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
     int32_t max_id;
     S max_weight;
+    S max_depth;
 
     tile_offsets += camera_id * tile_height * tile_width;
     render_colors += camera_id * image_height * image_width * COLOR_DIM;
     render_alphas += camera_id * image_height * image_width;
     last_ids += camera_id * image_height * image_width;
     max_ids += camera_id * image_height * image_width;
-    max_weights += camera_id * image_height * image_width;
+    max_weight_depths += camera_id * image_height * image_width;
+
 
     max_id = -1;
     max_weight = 0.0f;
+    max_depth = 0.0f;
 
     if (backgrounds != nullptr) {
         backgrounds += camera_id * COLOR_DIM;
@@ -83,8 +88,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             render_colors[pix_id * COLOR_DIM + k] =
                 backgrounds == nullptr ? 0.0f : backgrounds[k];
         }
+            
         max_ids[pix_id] = -1;
-        max_weights[pix_id] = 0.0f;
+
         return;
     }
 
@@ -177,7 +183,13 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             if (vis > max_weight) {
                 max_id = g;
                 max_weight = vis;
+                // the depth is defined as the last channel of the colors; c_ptr
+                max_depth = c_ptr[COLOR_DIM - 1];
             }
+
+            // accumulate weights for the backward pass
+            atomicAdd(&accumulated_weights_value[g], vis);
+            atomicAdd(&accumulated_weights_count[g], 1);
 
             cur_idx = batch_start + t;
 
@@ -204,12 +216,14 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
         // index of gaussian with max visibility in this pixel
         max_ids[pix_id] = max_id;
-        max_weights[pix_id] = max_weight;
+
+        // depth of the gaussian with max visibility in this pixel
+        max_weight_depths[pix_id] = max_depth;
     }
 }
 
 template <uint32_t CDIM>
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,    // [C, N, 3] or [nnz, 3]
@@ -256,7 +270,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         {C, image_height, image_width, channels},
         means2d.options().dtype(torch::kFloat32)
     );
-    torch::Tensor alphas = torch::empty(
+    torch::Tensor alphas = torch::zeros(
         {C, image_height, image_width, 1},
         means2d.options().dtype(torch::kFloat32)
     );
@@ -268,7 +282,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         {C, image_height, image_width, 1}, means2d.options().dtype(torch::kInt32)
     );
 
-    torch::Tensor max_weights = torch::empty(
+    torch::Tensor accumulated_weights_value = torch::zeros(
+        {C, N}, means2d.options().dtype(torch::kFloat32)
+    );
+
+    torch::Tensor accumulated_weights_count = torch::zeros(
+        {C, N}, means2d.options().dtype(torch::kInt32)
+    );
+
+    torch::Tensor max_weight_depths = torch::empty(
         {C, image_height, image_width, 1}, means2d.options().dtype(torch::kFloat32)
     );
 
@@ -315,13 +337,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
             max_ids.data_ptr<int32_t>(),
-            max_weights.data_ptr<float>()
+            accumulated_weights_value.data_ptr<float>(),
+            accumulated_weights_count.data_ptr<int32_t>(),
+            max_weight_depths.data_ptr<float>()
         );
 
-    return std::make_tuple(renders, alphas, last_ids, max_ids, max_weights);
+    return std::make_tuple(renders, alphas, last_ids, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_to_pixels_fwd_tensor(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
@@ -368,6 +392,7 @@ rasterize_to_pixels_fwd_tensor(
         __GS__CALL_(5)
         __GS__CALL_(8)
         __GS__CALL_(9)
+        __GS__CALL_(11)
         __GS__CALL_(16)
         __GS__CALL_(17)
         __GS__CALL_(32)

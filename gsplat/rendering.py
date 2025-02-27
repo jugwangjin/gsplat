@@ -47,7 +47,7 @@ def rasterization(
     sparse_grad: bool = False,
     absgrad: bool = False,
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
-    channel_chunk: int = 32,
+    channel_chunk: int = 64,
     distributed: bool = False,
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
     covars: Optional[Tensor] = None,
@@ -238,7 +238,7 @@ def rasterization(
     assert opacities.shape == (N,), opacities.shape
     assert viewmats.shape == (C, 4, 4), viewmats.shape
     assert Ks.shape == (C, 3, 3), Ks.shape
-    assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW", "F"], render_mode
+    assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW", "F", "NS"], render_mode
 
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(
@@ -484,6 +484,11 @@ def rasterization(
         quats = quats.unsqueeze(0).repeat(C, 1, 1) # shape of N, 4
         colors = torch.cat((rgbs, xyzs, quats, sh_coeffs, depths[..., None]), dim=-1) # shape of N, 3+4+1+3+k*3+1, 
 
+    elif render_mode in ["NS"]:
+        rgbs = colors # shape of N, 3
+        xyzs = means.unsqueeze(0).repeat(C, 1, 1) # shape of N, 3
+        quats = quats.unsqueeze(0).repeat(C, 1, 1) # shape of N, 4
+        colors = torch.cat((rgbs, xyzs, quats, depths[..., None]), dim=-1) # shape of N, 3+4+1+3+k*3+1, 
 
     elif render_mode in ["RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW"]:
         colors = torch.cat((colors, depths[..., None]), dim=-1)
@@ -549,7 +554,7 @@ def rasterization(
                 if backgrounds is not None
                 else None
             )
-            render_colors_, render_alphas_, max_ids_, max_weights_ = rasterize_to_pixels(
+            render_colors_, render_alphas_, max_ids_, accumulated_weights_value_, accumulated_weights_count_, max_weight_depth_ = rasterize_to_pixels(
                 means2d,
                 conics,
                 colors_chunk,
@@ -564,15 +569,17 @@ def rasterization(
                 absgrad=absgrad,
             )
             render_colors.append(render_colors_)
-            render_alphas.append(render_alphas_)
-            max_ids.append(max_ids_)
-            max_weights.append(max_weights_)
+            # render_alphas.append(render_alphas_)
+            # max_ids.append(max_ids_)
+            # max_weights.append(max_weights_)
         render_colors = torch.cat(render_colors, dim=-1)
-        render_alphas = render_alphas[0]  # discard the rest
-        max_ids = max_ids[0] # discard the rest
-        max_weights = max_weights[0] # discard the rest
+        render_alphas = render_alphas_  # discard the rest
+        max_ids = max_ids_ # discard the rest
+        accumulated_weights_value = accumulated_weights_value_
+        accumulated_weights_count = accumulated_weights_count_
+        max_weight_depth = max_weight_depth_
     else:
-        render_colors, render_alphas, max_ids, max_weights = rasterize_to_pixels(
+        render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depth = rasterize_to_pixels(
             means2d,
             conics,
             colors,
@@ -587,7 +594,8 @@ def rasterization(
             absgrad=absgrad,
         )
 
-    if render_mode in ["ED", "RGB+ED", "RGB+ED+IW", "F"]:
+
+    if render_mode in ["ED", "RGB+ED", "RGB+ED+IW", "F", "NS"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(
             [
@@ -597,7 +605,7 @@ def rasterization(
             dim=-1,
         )
 
-    if render_mode in ["RGB+IW", "RGB+ED+IW", "RGB+D+IW", "F"]:
+    if render_mode in ["RGB+IW", "RGB+ED+IW", "RGB+D+IW", "F", "NS"]:
         meta.update(
             {
                 "tile_width": tile_width,
@@ -611,11 +619,13 @@ def rasterization(
                 "tile_size": tile_size,
                 "n_cameras": C,
                 "max_ids": max_ids,
-                "max_weights": max_weights,
                 "means2d": means2d,
                 "radii": radii,
                 "rendered_sh_coeffs": sh_coeffs,
                 "depths": depths,   
+                "accumulated_weights_value": accumulated_weights_value,
+                "accumulated_weights_count": accumulated_weights_count,
+                "max_weight_depth": max_weight_depth,
             }
 
         )
@@ -808,7 +818,7 @@ def _rasterization(
             backgrounds=backgrounds,
             batch_per_iter=batch_per_iter,
         )
-    if render_mode in ["ED", "RGB+ED"]:
+    if render_mode in ["ED", "RGB+ED", "RGB+ED+IW", "F"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(
             [

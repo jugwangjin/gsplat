@@ -450,7 +450,8 @@ class Dataset:
             seed_index = np.random.choice(self.indices)
             # Query KDTree for nearest neighbors among training cameras.
             # k=5 gives a few neighbors; adjust if needed.
-            k = 5
+            # k to 10% of the training set size.
+            k = max(5, len(self.training_indices) // 10)
             distances, nn_local_idx = self.training_kd_tree.query(
                 self.parser.camtoworlds[seed_index, :3, 3], k=k
             )
@@ -459,12 +460,12 @@ class Dataset:
             # If there are fewer than 2 neighbors, fall back to random sampling.
             if len(nn_global) < 2:
                 additional = np.random.choice(list(set(self.indices) - {seed_index}), size=2, replace=False)
-                keyframe_indices = np.sort([seed_index] + additional.tolist())
+                keyframe_indices = [seed_index] + additional.tolist()
             else:
                 # Randomly select 2 neighbors from the nearest neighbors.
-                keyframe_indices = np.sort([seed_index] + list(np.random.choice(nn_global, size=2, replace=False)))
+                keyframe_indices = [seed_index] + list(np.random.choice(nn_global, size=2, replace=False))
         else:
-            keyframe_indices = np.sort(keyframe_indices)
+            keyframe_indices = keyframe_indices
         
         # Get the corresponding 3x4 poses from the parser.
         keyframe_poses = self.parser.camtoworlds[keyframe_indices, :3, :]  # shape (3, 3, 4)

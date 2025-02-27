@@ -1,3 +1,6 @@
+import os
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
+
 import json
 import math
 import os
@@ -28,7 +31,7 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from fused_ssim import fused_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, visualize_id_maps, depth_reinitialization
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, visualize_id_maps, depth_reinitialization, simplification
 from lib_bilagrid import (
     BilateralGrid,
     slice,
@@ -78,6 +81,12 @@ class Config:
     teacher_ckpt: str = None
     # The teacher's sampling ratio. If 0.1, the 10% of the teacher's GSs are used for the student.
     teacher_sampling_ratio: float = 0.01
+
+    target_sampling_ratio: float = 0.05
+
+    # depth_reinit_iters: List[int] = field(default_factory=lambda: [5_000, 10_000])
+    simp_iteration1: int = 5_000
+    simp_iteration2: int = 10_000
     # disable the reinitialization by expected depth, instead, use the xyz of the teacher's GSs.
     disable_depth_reinit: bool = False
     # 
@@ -116,15 +125,15 @@ class Config:
 
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 20_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [1, 5_000, 20_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [5_000, 20_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [5_000, 20_000])
 
 
     # Initialization strategy
@@ -323,227 +332,6 @@ def create_splats_with_optimizers(
     }
     return splats, optimizers
 
-@torch.no_grad()
-def create_splats_with_optimizers(
-    parser: Parser,
-    trainset,
-    cfg,
-    runner,
-    init_type: str = "sfm",
-    init_num_pts: int = 100_000,
-    init_extent: float = 3.0,
-    init_opacity: float = 0.1,
-    init_scale: float = 1.0,
-    scene_scale: float = 1.0,
-    sh_degree: int = 3,
-    sparse_grad: bool = False,
-    visible_adam: bool = False,
-    batch_size: int = 1,
-    feature_dim: Optional[int] = None,
-    device: str = "cuda",
-    world_rank: int = 0,
-    world_size: int = 1,
-) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-
-    sampling_ratio = cfg.teacher_sampling_ratio
-    trainloader = torch.utils.data.DataLoader(
-        trainset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=1,
-        persistent_workers=True,
-        pin_memory=True,
-    )
-    # trainloader_iter = iter(trainloader)
-
-    all_gaussian_ids = []
-    all_gaussian_weights = []
-    all_world_coords = []
-
-
-    accumulated_unprojected_xyzs = torch.zeros_like(runner.teacher_splats["means"]) # shape [N, 3]
-    num_unprojected_points = torch.zeros_like(runner.teacher_splats["means"][..., 0]) # shape [N]
-    
-    # exception case: ids = -1 
-    # to remove this, add index by 1, make a dummy tensor at the beginning, and remove it at the end.
-    accumulated_unprojected_xyzs = torch.cat([torch.zeros_like(accumulated_unprojected_xyzs[:1]), accumulated_unprojected_xyzs], dim=0)
-    num_unprojected_points = torch.cat([torch.zeros_like(num_unprojected_points[:1]), num_unprojected_points], dim=0)
-
-    pbar = tqdm.tqdm(trainloader)
-    for step, data in enumerate(pbar):
-        camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
-        Ks = data["K"].to(device)
-        sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
-        
-        pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
-        height, width = pixels.shape[1:3]
-
-        image_ids = data["image_id"].to(device)
-
-        if cfg.pose_noise:
-            camtoworlds = runner.pose_perturb(camtoworlds, image_ids)
-
-        if cfg.pose_opt:
-            camtoworlds = runner.pose_adjust(camtoworlds, image_ids)
-
-        masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
-            
-        renders, alphas, info = runner.rasterize_splats(
-            camtoworlds=camtoworlds,
-            Ks=Ks,
-            width=width,
-            height=height,
-            sh_degree=sh_degree_to_use,
-            near_plane=cfg.near_plane,
-            far_plane=cfg.far_plane,
-            image_ids=image_ids,
-            render_mode="RGB+ED+IW",
-            masks=masks,
-            splats=runner.teacher_splats,
-        )
-        # Precompute batch size (b) from the rendered info.
-        b = info["max_ids"].shape[0]  # [b, H, W, 1]
-
-        # Extract required tensors
-        gaussian_ids = info["max_ids"]         # [b, H, W, 1]
-        gaussian_weights = info["max_weights"]   # [b, H, W, 1]
-        depths = renders[..., -1:]               # [b, H, W, 1]
-
-        world_coords = depth_to_points(depths=depths, Ks=Ks, camtoworlds=camtoworlds)  # [b, H, W, 3]
-
-
-        '''
-        testing mini batch accumulation - disabling it.
-        '''
-        accumulated_unprojected_xyzs.index_add_(
-            0, gaussian_ids.reshape(-1).long() + 1, 
-            world_coords.reshape(-1, 3) * gaussian_weights.reshape(-1, 1)
-        )
-        num_unprojected_points.index_add_(
-            0, gaussian_ids.reshape(-1).long() + 1,
-            gaussian_weights.reshape(-1)
-        )
-
-    #     # Store the computed inverse-projected values.
-    #     all_gaussian_ids.append(gaussian_ids.reshape(b, -1, 1))  # [b, H*W, 1]
-    #     all_gaussian_weights.append(gaussian_weights.reshape(b, -1, 1))  # [b, H*W, 1]
-    #     all_world_coords.append(world_coords.reshape(b, -1, 3))  # [b, H*W, 3]
-
-    accumulated_unprojected_xyzs = accumulated_unprojected_xyzs[1:]
-    num_unprojected_points = num_unprojected_points[1:]
-
-    # # concatenate all the results
-    # all_gaussian_ids = torch.cat(all_gaussian_ids, dim=1).reshape(-1)  # [B]
-    # all_gaussian_ids = all_gaussian_ids.long()
-    # all_gaussian_weights = torch.cat(all_gaussian_weights, dim=1).reshape(-1)  # [B]
-    # all_world_coords = torch.cat(all_world_coords, dim=1).reshape(-1, 3)  # [B, 3]
-
-    # # DEBUG: save all_world_coords as pointcloud - to compare with already trained modelfpo-
-    # # sample only a million from the points randomly
-    # debug_world_coord_sample = all_world_coords[torch.randperm(all_world_coords.shape[0])[:1_000_000]]
-    # import open3d as o3d
-    # pcd = o3d.geometry.PointCloud()
-    
-    # pcd.points = o3d.utility.Vector3dVector(debug_world_coord_sample.cpu().numpy())
-    # o3d.io.write_point_cloud("debug_world_coords.ply", pcd)
-    
-    '''
-    testing mini batch accumulation - disabling it.
-    '''
-
-    # accumulated_unprojected_xyzs = torch.zeros_like(runner.teacher_splats["means"]) # shape [N, 3]
-    # num_unprojected_points = torch.zeros_like(runner.teacher_splats["means"][..., 0]) # shape [N]
-
-    # use all_gaussian_ids which ranging from 0 to N-1 to index into the splats to accumulate the unprojected xyzs
-
-
-    '''
-    testing mini batch accumulation - disabling it.
-    '''
-    # if cfg.apply_vis_on_teacher_sampling:
-    #     accumulated_unprojected_xyzs.index_add_(0, all_gaussian_ids, all_world_coords * all_gaussian_weights[..., None])
-    #     num_unprojected_points.index_add_(0, all_gaussian_ids, all_gaussian_weights)
-    # else:         
-    #     accumulated_unprojected_xyzs.index_add_(0, all_gaussian_ids, all_world_coords)
-    #     num_unprojected_points.index_add_(0, all_gaussian_ids, torch.ones_like(all_gaussian_weights))
-
-    # mean out
-    accumulated_unprojected_xyzs /= (num_unprojected_points[..., None].clamp(min=0))
-    
-    num_teacher_splats = int(sampling_ratio * len(accumulated_unprojected_xyzs))
-    
-    if isinstance(runner.cfg.strategy, DistillationStrategy) and runner.cfg.strategy.disable_pruning:
-        num_teacher_splats = num_teacher_splats // 10
-    
-    # filter out where num_unprojected_points is zero
-    valid_indices = num_unprojected_points > 1
-    accumulated_unprojected_xyzs = accumulated_unprojected_xyzs[valid_indices]
-    num_unprojected_points = num_unprojected_points[valid_indices]
-    
-    # sample the teacher splats, with teacher_sampling_ratio. 
-    # the sampling importance weights would be: num_unprojected_points / num_unprojected_points.sum()
-
-    # sample the teacher splats
-    teacher_indices = torch.multinomial(torch.log(num_unprojected_points.float().clamp(min=2)), num_teacher_splats, replacement=False)
-    # teacher_indices = torch.multinomial(num_unprojected_points.float(), num_teacher_splats, replacement=False)
-    
-    if cfg.disable_depth_reinit:
-        teacher_splats_means = runner.teacher_splats["means"][valid_indices][teacher_indices]
-    else:
-        teacher_splats_means = accumulated_unprojected_xyzs[teacher_indices]
-    teacher_splats_scales = runner.teacher_splats["scales"][valid_indices][teacher_indices]
-    teacher_splats_quats = runner.teacher_splats["quats"][valid_indices][teacher_indices]
-    teacher_splats_opacities = runner.teacher_splats["opacities"][valid_indices][teacher_indices]
-    teacher_splats_sh0 = runner.teacher_splats["sh0"][valid_indices][teacher_indices]
-    teacher_splats_shN = runner.teacher_splats["shN"][valid_indices][teacher_indices]
-
-    # create the student splats
-    points = teacher_splats_means[world_rank::world_size]
-    N = points.shape[0]
-    scales = teacher_splats_scales[world_rank::world_size]
-    quats = teacher_splats_quats[world_rank::world_size]
-    opacities = teacher_splats_opacities[world_rank::world_size]
-    sh0 = teacher_splats_sh0[world_rank::world_size]
-    shN = teacher_splats_shN[world_rank::world_size]
-
-    params = [
-        # name, value, lr
-        ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
-        ("scales", torch.nn.Parameter(scales+math.log(2)), 5e-3),
-        ("quats", torch.nn.Parameter(quats), 1e-3),
-        ("opacities", torch.nn.Parameter(opacities), 5e-2),
-    ]
-
-    params.append(("sh0", torch.nn.Parameter(sh0), 2.5e-3))
-    params.append(("shN", torch.nn.Parameter(shN), 2.5e-3 / 20))
-    
-    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
-    # Scale learning rate based on batch size, reference:
-    # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
-    # Note that this would not make the training exactly equivalent, see
-    # https://arxiv.org/pdf/2402.18824v1
-    BS = batch_size * world_size
-    optimizer_class = None
-    if sparse_grad:
-        optimizer_class = torch.optim.SparseAdam
-    elif visible_adam:
-        optimizer_class = SelectiveAdam
-    else:
-        optimizer_class = torch.optim.Adam
-    optimizers = {
-        name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-        )
-        for name, _, lr in params
-    }
-
-    torch.cuda.empty_cache()
-    del teacher_splats_means, teacher_splats_scales, teacher_splats_quats, teacher_splats_opacities, teacher_splats_sh0, teacher_splats_shN
-    return splats, optimizers
-
 
 class Runner:
     """Engine for training and testing."""
@@ -618,6 +406,10 @@ class Runner:
             self.teacher_splats[k] = teacher_ckpt["splats"][k].to(self.device).data
 
 
+        self.splats = {}
+        for k in teacher_ckpt["splats"].keys():
+            self.splats[k] = torch.nn.Parameter(teacher_ckpt["splats"][k].to(self.device).data)
+
         if cfg.original_initialization:
             feature_dim = 32 if cfg.app_opt else None
             self.splats, self.optimizers = create_splats_with_optimizers(
@@ -638,24 +430,48 @@ class Runner:
                 world_size=world_size,
             )
         else:
-            num_depth = int(cfg.teacher_sampling_ratio * len(self.teacher_splats["means"]))
-            self.splats, self.optimizers = depth_reinitialization(
+            num_depth = int(cfg.target_sampling_ratio * 4 * len(self.teacher_splats["means"]))
+            target_n_gaussians = int(cfg.target_sampling_ratio * 4 * len(self.teacher_splats["means"]))
+            current_n_gaussians = len(self.teacher_splats["means"])
+            sampling_factor = min(1, target_n_gaussians / current_n_gaussians)
+
+            print(target_n_gaussians, current_n_gaussians, sampling_factor)
+            
+            self.splats, self.optimizers = simplification(
                 trainset = self.trainset,
-                num_depth=num_depth,
                 runner = self,
                 parser = self.parser,
-                cfg=self.cfg,
-                batch_size = cfg.batch_size,
-                sparse_grad = cfg.sparse_grad,
+                cfg = self.cfg,
+                sampling_factor = sampling_factor,
+                cdf_threshold = 0.99,
+                use_cdf_mask = False,
+                keep_sh0 = True,
+                keep_feats = True,
+                batch_size=cfg.batch_size,
+                sparse_grad=cfg.sparse_grad,
                 visible_adam=cfg.visible_adam,
                 world_size=world_size,
                 init_scale=cfg.init_scale,
-                init_extent=cfg.init_extent,
                 scene_scale=self.scene_scale,
-                init_num_pts=cfg.init_num_pts,
-                device=self.device,
-                init_type=cfg.init_type,
             )
+
+            # self.splats, self.optimizers = depth_reinitialization(
+            #     trainset = self.trainset,
+            #     num_depth=num_depth,
+            #     runner = self,
+            #     parser = self.parser,
+            #     cfg=self.cfg,
+            #     batch_size = cfg.batch_size,
+            #     sparse_grad = cfg.sparse_grad,
+            #     visible_adam=cfg.visible_adam,
+            #     world_size=world_size,
+            #     init_scale=cfg.init_scale,
+            #     init_extent=cfg.init_extent,
+            #     scene_scale=self.scene_scale,
+            #     init_num_pts=cfg.init_num_pts,
+            #     device=self.device,
+            #     init_type=cfg.init_type,
+            # )
             
 
         print("Model initialized. Number of GS:", len(self.splats["means"]))
@@ -757,6 +573,7 @@ class Runner:
             ).to(self.device)
         else:
             raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
+
 
         # Viewer
         if not self.cfg.disable_viewer:
@@ -926,6 +743,9 @@ class Runner:
             if cfg.pose_opt:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
+            render_mode = "NS" if cfg.distill and cfg.distill_sh_lambda == 0 else "F" if cfg.distill else "RGB+ED+IW"
+            
+
             with torch.no_grad():
                 teacher_renders, _, _ = self.rasterize_splats(
                     camtoworlds=camtoworlds,
@@ -936,7 +756,7 @@ class Runner:
                     near_plane=cfg.near_plane,
                     far_plane=cfg.far_plane,
                     image_ids=image_ids,
-                    render_mode="F",
+                    render_mode=render_mode,
                     masks=masks,
                     splats = self.teacher_splats
                 )
@@ -949,7 +769,7 @@ class Runner:
                 teacher_depths = teacher_renders[..., -1:].detach().data # [1, H, W, 1]
 
                 del teacher_renders
-
+    
             if cfg.use_novel_view:
 
                 data_ = self.trainset.sample_novel_views(batch_size=cfg.batch_size)
@@ -967,7 +787,7 @@ class Runner:
                         near_plane=cfg.near_plane,
                         far_plane=cfg.far_plane,
                         image_ids=image_ids_,
-                        render_mode="F",
+                        render_mode=render_mode,
                         masks=masks,
                         splats = self.teacher_splats
                     )
@@ -992,13 +812,11 @@ class Runner:
                     # teacher_sh0 = torch.cat([teacher_sh0, teacher_sh0_], dim=0)
                     # teacher_shN = torch.cat([teacher_shN, teacher_shN_], dim=0)
                     teacher_depths = torch.cat([teacher_depths, teacher_depths_], dim=0)
+
     
                 Ks = torch.cat([Ks, Ks_], dim=0)
                 camtoworlds = torch.cat([camtoworlds, camtoworlds_], dim=0)
                 image_ids = torch.cat([image_ids, image_ids_], dim=0)
-
-
-
 
             # forward
             renders, alphas, info = self.rasterize_splats(
@@ -1010,7 +828,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="F" if cfg.distill else "RGB+ED+IW",
+                render_mode=render_mode,
                 masks=masks,
             )
 
@@ -1055,10 +873,14 @@ class Runner:
                 colorloss = F.l1_loss(colors, teacher_rgb) * cfg.distill_colors_lambda
                 loss += colorloss
 
-                xyzloss = F.l1_loss(xyzs, teacher_xyzs) * cfg.distill_xyzs_lambda * self.scene_scale
+                xyzloss = F.l1_loss(xyzs, teacher_xyzs) * cfg.distill_xyzs_lambda 
                 loss += xyzloss
 
-                depthloss = F.l1_loss(depths, teacher_depths) * cfg.distill_depth_lambda * self.scene_scale
+                # make a mask both depths and teacher depths are larger than 0 
+                mask = (depths > 0) & (teacher_depths > 0)
+                depths = torch.where(mask, depths, torch.zeros_like(depths))
+                teacher_depths = torch.where(mask, teacher_depths, torch.zeros_like(teacher_depths))
+                depthloss = F.l1_loss(depths, teacher_depths) * cfg.distill_depth_lambda
                 loss += depthloss
 
                 quatloss = F.l1_loss(quats, teacher_quats) * cfg.distill_quats_lambda
@@ -1110,6 +932,8 @@ class Runner:
                     desc += f"quatloss={quatloss.item():.3f}| "
                 if cfg.distill_sh_lambda > 0.0:
                     desc += f"shloss={shloss.item():.3f}| "
+            key_for_gradient = self.cfg.strategy.key_for_gradient
+            desc += f"key = {key_for_gradient}|"
                 # if cfg.distill_sh0_lambda > 0.0:
                 #     desc += f"sh0loss={sh0loss.item():.3f}| "
                 # if cfg.distill_shN_lambda > 0.0:
@@ -1172,8 +996,8 @@ class Runner:
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
             if (
-                step in [i - 1 for i in cfg.ply_steps]
-                or step == max_steps - 1
+                (step in [i - 1 for i in cfg.ply_steps]
+                or step == max_steps - 1)
                 and cfg.save_ply
             ):
                 rgb = None
@@ -1218,6 +1042,7 @@ class Runner:
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, Distill2DStrategy):
+
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -1226,6 +1051,92 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
+
+                if (step+1) == cfg.simp_iteration1:
+                    target_num_gs = int(self.teacher_splats["means"].shape[0] * self.cfg.target_sampling_ratio * 2)
+                    current_num_gs = len(self.splats["means"])
+                    sampling_factor = min(1, float(target_num_gs)  / float(current_num_gs))
+                    
+                    self.splats, self.optimizers = simplification(
+                        trainset = self.trainset,
+                        runner = self,
+                        parser = self.parser,
+                        cfg = self.cfg,
+                        sampling_factor = sampling_factor,
+                        cdf_threshold = 0.99,
+                        use_cdf_mask = False,
+                        keep_sh0 = True,
+                        keep_feats = False,
+                        batch_size=cfg.batch_size,
+                        sparse_grad=cfg.sparse_grad,
+                        visible_adam=cfg.visible_adam,
+                        world_size=world_size,
+                        init_scale=cfg.init_scale,
+                        scene_scale=self.scene_scale,
+                        optimizers = self.optimizers
+                    )
+
+                    print("Number of GS before simplification: ", current_num_gs)
+                    print("Number of GS after simplification: ", len(self.splats["means"]))
+                    # Densification Strategy
+                    self.cfg.strategy.check_sanity(self.splats, self.optimizers)
+
+                    if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, Distill2DStrategy):
+                        self.strategy_state = self.cfg.strategy.initialize_state(
+                            scene_scale=self.scene_scale
+                        )
+                    elif isinstance(self.cfg.strategy, MCMCStrategy):
+                        self.strategy_state = self.cfg.strategy.initialize_state()
+                    elif isinstance(self.cfg.strategy, DistillationStrategy):   
+                        self.strategy_state = self.cfg.strategy.initialize_state()
+                        self.cfg.strategy.teacher_sampling_ratio = self.cfg.teacher_sampling_ratio
+                    else:
+                        assert_never(self.cfg.strategy)
+
+
+                elif (step+1) == cfg.simp_iteration2:
+                    target_num_gs = int(self.teacher_splats["means"].shape[0] * self.cfg.target_sampling_ratio * 2)
+                    current_num_gs = len(self.splats["means"])
+                    sampling_factor = min(1, float(target_num_gs) / float(current_num_gs))
+                    self.splats, self.optimizers = simplification(
+                        trainset = self.trainset,
+                        runner = self,
+                        parser = self.parser,
+                        cfg = self.cfg,
+                        sampling_factor = sampling_factor,
+                        cdf_threshold = 0.99,
+                        use_cdf_mask = True,
+                        keep_sh0 = True,
+                        keep_feats = True,
+                        batch_size=cfg.batch_size,
+                        sparse_grad=cfg.sparse_grad,
+                        visible_adam=cfg.visible_adam,
+                        world_size=world_size,
+                        init_scale=cfg.init_scale,
+                        scene_scale=self.scene_scale,
+                        optimizers = self.optimizers
+                    )
+
+                    print("Number of GS before simplification: ", current_num_gs)
+                    print("Number of GS after simplification: ", len(self.splats["means"]))
+
+                    # Densification Strategy
+                    self.cfg.strategy.check_sanity(self.splats, self.optimizers)
+
+                    if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, Distill2DStrategy):
+                        self.strategy_state = self.cfg.strategy.initialize_state(
+                            scene_scale=self.scene_scale
+                        )
+                    elif isinstance(self.cfg.strategy, MCMCStrategy):
+                        self.strategy_state = self.cfg.strategy.initialize_state()
+                    elif isinstance(self.cfg.strategy, DistillationStrategy):   
+                        self.strategy_state = self.cfg.strategy.initialize_state()
+                        self.cfg.strategy.teacher_sampling_ratio = self.cfg.teacher_sampling_ratio
+                    else:
+                        assert_never(self.cfg.strategy)
+
+
+
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -1250,10 +1161,6 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
-
-            # if reaches 20% of teacher
-            if self.splats["means"].shape[0] > 0.2 * self.teacher_splats["means"].shape[0]:
-                raise RuntimeError("Too many splats, aborting training.")
 
             # optimize
             for optimizer in self.optimizers.values():

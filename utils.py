@@ -7,6 +7,421 @@ from torch import Tensor
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
+import tqdm
+import math
+from gsplat.utils import save_ply, depth_to_points
+from torch.utils.data import Dataset
+from gsplat.optimizers import SelectiveAdam
+
+from gsplat.strategy.ops import duplicate, remove, reset_opa, split
+
+
+
+
+
+
+@torch.no_grad()
+def create_splats_and_optimizers_from_data(
+    xyzs: Tensor,
+    rgbs: Tensor,
+    runner=None,
+    device: str = "cuda",
+    batch_size: int = 1,
+    sparse_grad: bool = False,
+    visible_adam: bool = False,
+    world_size: int = 1,
+    init_scale: float = 1.0,
+    scene_scale: float = 1.0,
+    shN = None,
+    scales=None,
+    quats=None,
+    opacities=None,
+    optimizers=None,
+    keep_feats=False,
+    indices=None
+):
+    shN_channels = 15 if runner is None else runner.splats["shN"].shape[1]
+
+    # xyzs shape of N, 3
+    # rgbs shape of N, 3
+    means = xyzs 
+    if len(rgbs.shape) == 2:
+        rgbs = rgbs[:, None]
+    sh0 = rgb_to_sh(rgbs)
+    if shN is None:
+        shN = torch.zeros((sh0.shape[0], shN_channels, 3), device=device)
+
+
+    if scales is None:
+    # Initialize the GS size to be the average dist of the 3 nearest neighbors
+        dist2_avg = (knn(means, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+
+    if quats is None:
+        quats = torch.rand((means.shape[0], 4), device=device)  # [N, 4]\
+    if opacities is None:
+        opacities = torch.logit(torch.full((means.shape[0],), 0.1, device=device))  # [N,]
+
+
+    params = [
+        # name, value, lr
+        ("means", torch.nn.Parameter(means.clone().detach().data), 1.6e-4 * scene_scale),
+        ("scales", torch.nn.Parameter(scales.clone().detach().data), 5e-3),
+        ("quats", torch.nn.Parameter(quats.clone().detach().data), 1e-3),
+        ("opacities", torch.nn.Parameter(opacities.clone().detach().data), 5e-2),
+        ("sh0", torch.nn.Parameter(sh0.clone().detach().data), 2.5e-3),
+        ("shN", torch.nn.Parameter(shN.clone().detach().data), 2.5e-3 / 20),
+    ]
+
+    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
+
+    new_n_gaussians = means.shape[0]
+
+    if optimizers is None:
+        # Scale learning rate based on batch size, reference:
+        # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
+        # Note that this would not make the training exactly equivalent, see
+        # https://arxiv.org/pdf/2402.18824v1
+        BS = batch_size * world_size
+        optimizer_class = None
+        if sparse_grad:
+            optimizer_class = torch.optim.SparseAdam
+        elif visible_adam:
+            optimizer_class = SelectiveAdam
+        else:
+            optimizer_class = torch.optim.Adam
+        optimizers = {
+            name: optimizer_class(
+                [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+                eps=1e-15 / math.sqrt(BS),
+                # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+                betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            )
+            for name, _, lr in params
+        }
+    else:
+
+        if not keep_feats:
+            def optimizer_fn(key, v):
+                # shape : [new n gaussians, v shape [1:]]
+                # I don't know the length of v shape
+
+                num_v = torch.zeros(new_n_gaussians, *v.shape[1:], device=device)
+                return num_v
+        else:
+            def optimizer_fn(key, v):
+                # shape : [new n gaussians, v shape [1:]]
+                # I don't know the length of v shape
+                return v[indices]
+
+        for name in [n for n, _, _ in params]:
+            param = runner.splats[name]
+            new_param = splats[name]
+            if name not in optimizers:
+                assert not param.requires_grad, (
+                    f"Optimizer for {name} is not found, but the parameter is trainable."
+                    f"Got requires_grad={param.requires_grad}"
+                )
+                continue
+            optimizer = optimizers[name]
+            for i in range(len(optimizer.param_groups)):
+                param_state = optimizer.state[param]
+                del optimizer.state[param]
+                for key in param_state.keys():
+                    if key != "step":
+                        v = param_state[key]
+                        param_state[key] = optimizer_fn(key, v)
+                optimizer.param_groups[i]["params"] = [new_param]
+                optimizer.state[new_param] = param_state
+
+
+
+    # # Scale learning rate based on batch size, reference:
+    # # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
+    # # Note that this would not make the training exactly equivalent, see
+    # # https://arxiv.org/pdf/2402.18824v1
+    # BS = batch_size * world_size
+    # optimizer_class = None
+    # if sparse_grad:
+    #     optimizer_class = torch.optim.SparseAdam
+    # elif visible_adam:
+    #     optimizer_class = SelectiveAdam
+    # else:
+    #     optimizer_class = torch.optim.Adam
+    # optimizers = {
+    #     name: optimizer_class(
+    #         [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+    #         eps=1e-15 / math.sqrt(BS),
+    #         # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+    #         betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+    #     )
+    #     for name, _, lr in params
+    # }
+    return splats, optimizers
+
+
+@torch.no_grad()
+def init_cdf_mask(importance, thres=1.0):
+    importance = importance.flatten()   
+    if thres!=1.0:
+        percent_sum = thres
+        vals,idx = torch.sort(importance+(1e-6))
+        cumsum_val = torch.cumsum(vals, dim=0)
+        split_index = ((cumsum_val/vals.sum()) > (1-percent_sum)).nonzero().min()
+        split_val_nonprune = vals[split_index]
+
+        non_prune_mask = importance>split_val_nonprune 
+    else: 
+        non_prune_mask = torch.ones_like(importance).bool()
+    
+    prune_mask = ~non_prune_mask
+
+    return prune_mask
+
+
+@torch.no_grad()
+def simplification(
+    trainset: Dataset, 
+    runner,
+    parser,
+    cfg,
+    sampling_factor: float = 0.1,
+    cdf_threshold: float = 0.99,
+    use_cdf_mask: bool = False,
+    keep_sh0: bool = True,
+    keep_feats: bool = False,
+    batch_size: int = 1,
+    sparse_grad: bool = False,
+    visible_adam: bool = False,
+    world_size: int = 1,
+    init_scale: float = 1.0,
+    scene_scale: float = 1.0,
+    optimizers=None,
+):
+    
+    trainloader = torch.utils.data.DataLoader(
+        trainset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=1,
+        persistent_workers=True,
+        pin_memory=True,
+    )
+
+    n_gaussian = runner.splats["means"].shape[0]
+
+    importance_scores = torch.zeros(n_gaussian, device=runner.splats["means"].device)
+    pixels_per_gaussian = torch.zeros(n_gaussian, device=runner.splats["means"].device, dtype=torch.int)
+
+    trainloader_iter = iter(trainloader)
+
+    for step in tqdm.tqdm(range(len(trainloader))):
+        data = next(trainloader_iter)
+
+        pixel = data["image"].to(runner.splats["means"].device) / 255.0
+        camtoworlds = camtoworlds_gt = data["camtoworld"].to(runner.splats["means"].device)
+        Ks = data["K"].to(runner.splats["means"].device)
+        image_ids = data["image_id"].to(runner.splats["means"].device)
+        masks = data["mask"].to(runner.splats["means"].device) if "mask" in data else None
+
+        width, height = pixel.shape[1:3]
+
+        # forward
+        _, _, info = runner.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=0,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+            image_ids=image_ids,
+            render_mode="RGB+IW",
+            masks=masks,
+        )
+
+
+        max_ids = info["max_ids"]
+
+        max_ids_valid_mask = max_ids >= 0
+
+        max_ids = max_ids % n_gaussian
+
+        batch_pixels_per_gaussian = torch.zeros_like(pixels_per_gaussian)
+        batch_pixels_per_gaussian.index_add_(
+            0, max_ids[max_ids_valid_mask].flatten(), torch.ones_like(max_ids[max_ids_valid_mask]).flatten()
+        )
+
+        pixels_per_gaussian += batch_pixels_per_gaussian
+
+        accumulated_weights_value = info["accumulated_weights_value"] # C N
+        accumulated_weights_count = info["accumulated_weights_count"] # C N
+
+
+        # add importance score to impotance_scores, but only where accumulated_weights_count > 0
+        for i in range(accumulated_weights_value.shape[0]):
+            importance_score = accumulated_weights_value[i] / (accumulated_weights_count[i].clamp(min=1))
+            accumulated_weights_valid_mask = torch.logical_and(batch_pixels_per_gaussian > 0, accumulated_weights_count[i] > 0)
+            importance_scores[accumulated_weights_valid_mask] += importance_score[accumulated_weights_valid_mask]
+
+    zero_pixels_per_gaussian = pixels_per_gaussian == 0
+    importance_scores[zero_pixels_per_gaussian] = 0
+
+    if use_cdf_mask:
+        sampling_mask = init_cdf_mask(importance_scores, cdf_threshold)
+        indices = torch.nonzero(sampling_mask, as_tuple=True)[0]
+
+    else:
+
+        prob = importance_scores / importance_scores.sum()
+        prob = prob.cpu().numpy()
+              
+        n_sample = int(n_gaussian * sampling_factor * ((prob !=0).sum()/prob.shape[0]))
+
+        indices = np.random.choice(n_gaussian, n_sample, p=prob, replace=False)
+
+        # indices = np.unique(indices)
+
+        sampling_mask = torch.ones(n_gaussian, device=runner.splats["means"].device)
+        sampling_mask[indices] = 0
+
+    # if keep_gradients:
+    #     remove(runner.splats, runner.optimizers, strategy.state, sampling_mask)
+    #     splats, optimizers = runner.splats, runner.optimizers
+
+    # else
+
+    splats, optimizers = create_splats_and_optimizers_from_data(
+        runner.splats["means"][indices],
+        sh0_to_rgb(runner.splats["sh0"][indices]),
+        runner=runner,
+        device=runner.splats["means"].device,
+        batch_size=batch_size,
+        sparse_grad=sparse_grad,
+        visible_adam=visible_adam,
+        world_size=world_size,
+        init_scale=init_scale,
+        scene_scale=scene_scale,
+        shN=runner.splats["shN"][indices] if keep_feats else None,
+        scales=runner.splats["scales"][indices] if keep_feats else None,
+        quats=runner.splats["quats"][indices] if keep_feats else None,
+        opacities=runner.splats["opacities"][indices] if keep_feats else None,
+        optimizers=optimizers,
+        keep_feats=keep_feats,
+        indices=indices 
+    )
+
+    return splats, optimizers
+
+@torch.no_grad()
+def depth_reinitialization(
+        trainset: Dataset,
+        num_depth: int,
+        runner,
+        parser,
+        cfg,
+        batch_size: int = 1,
+        sparse_grad: bool = False,
+        visible_adam: bool = False,
+        world_size: int = 1,
+        init_scale: float = 1.0,
+        init_extent: float = 3.0,
+        scene_scale: float = 1.0,
+        init_num_pts: int = 100_000,
+        device: str = "cuda",
+        init_type: str = "sfm",
+        optimizers=None
+):
+    
+    trainloader = torch.utils.data.DataLoader(
+        trainset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=1,
+        persistent_workers=True,
+        pin_memory=True,
+    )
+
+    out_pts_list = []
+    gt_list = []
+    
+    trainloader_iter = iter(trainloader)
+
+    # Training loop.
+    pbar = tqdm.tqdm(range(len(trainloader)))
+    for step in pbar:
+        data = next(trainloader_iter)
+
+        pixel = data["image"].to(device) / 255.0  # [1, H, W, 3]
+        camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+        Ks = data["K"].to(device)  # [1, 3, 3]
+        image_ids = data["image_id"].to(device)
+        masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+    
+        width, height = pixel.shape[1:3]
+        
+        # forward
+        renders, alphas, info = runner.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=0,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+            image_ids=image_ids,
+            render_mode="RGB+ED+IW",
+            masks=masks,
+        )
+
+        # depths = renders[..., -1:]
+        depths = info["max_weight_depth"] # [b, H, W, 1]
+        world_coords = depth_to_points(depths=depths, Ks=Ks, camtoworlds=camtoworlds)  # [b, H, W, 3]
+        
+        prob = alphas # shape of [b, H, W, 1]
+        # prob = 1 - alphas # shape of [b, H, W, 1]
+
+        # if info["max_ids"] < 0: prob = 0
+        # max_ids = info["max_ids"] # shape of [b, H, W, 1]
+        # prob[max_ids < 0] = 0
+
+        prob = prob / prob.sum() 
+        # print(prob.shape, depths.shape, world_coords.shape, alphas.shape)
+        prob = prob.reshape(-1).cpu().numpy() 
+
+        factor = 1 / (width * height * len(trainloader) / num_depth)
+
+        N_xyz = prob.shape[0]
+        num_sampled = min(N_xyz, int(N_xyz * factor))
+
+        indices = np.random.choice(N_xyz, num_sampled, p=prob, replace=False)
+        
+
+        world_coords = world_coords.reshape(-1, 3)
+        gt = pixel.reshape(-1, 3)
+
+        out_pts_list.append(world_coords[indices])
+        gt_list.append(gt[indices])
+    
+    out_pts_merged = torch.cat(out_pts_list, dim=0)
+    gt_merged = torch.cat(gt_list, dim=0)
+
+    splats, optimizers = create_splats_and_optimizers_from_data(
+        out_pts_merged,
+        gt_merged,
+        runner=runner,
+        device=device,
+        batch_size=batch_size,
+        sparse_grad=sparse_grad,
+        visible_adam=visible_adam,
+        world_size=world_size,
+        init_scale=init_scale,
+        scene_scale=scene_scale,
+        optimizers=optimizers
+    )
+
+    return splats, optimizers
 
 
 class CameraOptModule(torch.nn.Module):
@@ -149,6 +564,9 @@ def rgb_to_sh(rgb: Tensor) -> Tensor:
     C0 = 0.28209479177387814
     return (rgb - 0.5) / C0
 
+def sh0_to_rgb(sh0: Tensor) -> Tensor:
+    C0 = 0.28209479177387814
+    return sh0 * C0 + 0.5
 
 def set_random_seed(seed: int):
     random.seed(seed)
