@@ -11,6 +11,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Define CUDA flags
 set(NVCC_FLAGS "-O3 --use_fast_math")
+# set(NVCC_FLAGS "-O3 --use_fast_math -gencode=arch=compute_70,code=sm_70")
 
 # Get the Torch path from Python
 execute_process(

@@ -125,3 +125,8 @@ data
 results
 
 !examples/benchmarks/compression/results/
+
+*.csv
+*.ply
+*.png
+*.xlsx

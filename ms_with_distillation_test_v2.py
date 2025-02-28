@@ -83,13 +83,13 @@ def generate_commands():
     # if not os.path.exists('/Bean/log/gwangjin/2025/kdgs/ms_d/bicycle/ckpts/ckpt_29999_rank0.pt'):
     #     commands.append("python ms_d_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/ms_d/bicycle --disable_viewer")
 
-    if True or not os.path.exists('/Bean/log/gwangjin/2025/kdgs/ms_d/bicycle_depth_reinit/ckpts/ckpt_29999_rank0.pt'):
-        commands.append("python ms_d_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/ms_d/bicycle_depth_reinit --use_depth_reinit --disable_viewer")
+    # if True or not os.path.exists('/Bean/log/gwangjin/2025/kdgs/ms_d/bicycle_depth_reinit/ckpts/ckpt_29999_rank0.pt'):
+        # commands.append("python ms_d_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/ms_d/bicycle_depth_reinit --use_depth_reinit --disable_viewer")
 
     if True or not os.path.exists('/Bean/log/gwangjin/2025/kdgs/ms/bicycle_depth_reinit_sampling_0.5/ckpts/ckpt_29999_rank0.pt'):
         commands.append("python ms_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/ms/bicycle_depth_reinit_sampling_0.5 --use_depth_reinit --sampling_factor 0.5 --disable_viewer")
-    if True or not os.path.exists('/Bean/log/gwangjin/2025/kdgs/ms/bicycle_depth_reinit_sampling_0.25/ckpts/ckpt_29999_rank0.pt'):
-        commands.append("python ms_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/ms/bicycle_depth_reinit_sampling_0.25 --use_depth_reinit --sampling_factor 0.25 --disable_viewer")
+    # if True or not os.path.exists('/Bean/log/gwangjin/2025/kdgs/ms/bicycle_depth_reinit_sampling_0.25/ckpts/ckpt_29999_rank0.pt'):
+        # commands.append("python ms_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/ms/bicycle_depth_reinit_sampling_0.25 --use_depth_reinit --sampling_factor 0.25 --disable_viewer")
 
 
     return commands

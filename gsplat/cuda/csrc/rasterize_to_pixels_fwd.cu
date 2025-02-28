@@ -290,8 +290,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         {C, N}, means2d.options().dtype(torch::kInt32)
     );
 
-    torch::Tensor max_weight_depths = torch::empty(
-        {C, image_height, image_width, 1}, means2d.options().dtype(torch::kFloat32)
+    torch::Tensor max_weight_depths = torch::full(
+        {C, image_height, image_width, 1}, -1, means2d.options().dtype(torch::kFloat32)
     );
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();

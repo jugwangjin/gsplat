@@ -58,6 +58,7 @@ class Config:
     use_depth_reinit: bool = False
     depth_reinit_iters: List[int] = field(default_factory=lambda: [5_000, 10_000])
     num_depth: int = 3_500_000
+    num_max: int = 4_500_000
 
     simp_iteration1: int = 15_000
     simp_iteration2: int = 20_000
@@ -606,7 +607,7 @@ class Runner:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
             # sh schedule
-            sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+            sh_degree_to_use = max(0, min((step - cfg.simp_iteration1) // cfg.sh_degree_interval, cfg.sh_degree))
 
             # forward
             renders, alphas, info = self.rasterize_splats(
@@ -819,6 +820,11 @@ class Runner:
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, MSDStrategy):
+                info.update({
+                    "depth_reinit_iter" : step in cfg.depth_reinit_iters,
+                    "num_max" : cfg.num_max,
+                }
+                )
 
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -848,6 +854,7 @@ class Runner:
                         device=self.device,
                         init_type=cfg.init_type,
                         optimizers=self.optimizers,
+                        replace=False,
                     )
 
                     print("Number of Gaussians before depth reinitialization: ", n_gaussians)
@@ -961,6 +968,24 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+
+
+            '''
+            reset learning rate by resetting scheduler - same as minisplatting 
+            '''
+
+            if step == self.cfg.strategy.refine_stop_iter: 
+                self.optimizers["means"].lr = 1.6e-4 * self.scene_scale
+                schedulers = [
+                    # means has a learning rate schedule, that end at 0.01 of the initial value
+                    torch.optim.lr_scheduler.ExponentialLR(
+                        self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                    ),
+                ]
+
+                for _ in range(5000):
+                    scheduler.step()
+
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:

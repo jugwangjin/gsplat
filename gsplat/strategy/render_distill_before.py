@@ -8,6 +8,10 @@ from .ops import duplicate, remove, reset_opa, split
 from typing_extensions import Literal
 
 
+'''
+OLD VERSION
+'''
+
 @dataclass
 class Distill2DStrategy(Strategy):
     """A default strategy that follows the original 3DGS paper:
@@ -84,7 +88,7 @@ class Distill2DStrategy(Strategy):
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 500
-    refine_stop_iter: int = 5_000
+    refine_stop_iter: int = 15_000
     reset_every: int = 3000
     refine_every: int = 100
     pause_refine_after_reset: int = 0
@@ -92,15 +96,15 @@ class Distill2DStrategy(Strategy):
     revised_opacity: bool = False
 
     verbose: bool = False
-    key_for_gradient: Literal["means2d", "gradient_2dgs", "quat", "depths", "rendered_sh_coeffs","depths_and_sh"] = "means2d"
+    key_for_gradient: Literal["means2d", "gradient_2dgs", "quat", "sh_coeffs", "depths", "rendered_sh_coeffs","depths_and_sh"] = "means2d"
 
     sh_coeffs_mult: float = 50
     depths_mult: float = 10
 
     use_blur_split: bool = False
-    blur_threshold: float = 4e-4
+    blur_threshold: float = 2e-4
 
-    def initialize_state(self, scene_scale: float = 1.0, target_num_gaussians = 1000000) -> Dict[str, Any]:
+    def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
 
         The returned state should be passed to the `step_pre_backward()` and
@@ -114,7 +118,6 @@ class Distill2DStrategy(Strategy):
         state = {"grad2d": None, "count": None, "scene_scale": scene_scale, "blur_mask": None}
         if self.refine_scale2d_stop_iter > 0:
             state["radii"] = None
-        self.target_num_gaussians = target_num_gaussians
         return state
 
     def check_sanity(
@@ -183,6 +186,7 @@ class Distill2DStrategy(Strategy):
 
         self._update_state(params, state, info, packed=packed)
 
+
         if (
             step > self.refine_start_iter
             and step % self.refine_every == 0
@@ -194,7 +198,7 @@ class Distill2DStrategy(Strategy):
             if self.verbose:
                 print(
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split ({n_blur} GSs dup/split for blur) "
-                    f"Now having {len(params['means'])} GSs, target: {self.target_num_gaussians}. key: {self.key_for_gradient}"
+                    f"Now having {len(params['means'])} GSs."
                 )
 
             # prune GSs
@@ -214,13 +218,13 @@ class Distill2DStrategy(Strategy):
                 state["radii"].zero_()
             torch.cuda.empty_cache()
 
-        # if step % self.reset_every == 0:
-        #     reset_opa(
-        #         params=params,
-        #         optimizers=optimizers,
-        #         state=state,
-        #         value=self.prune_opa * 2.0,
-        #     )
+        if step % self.reset_every == 0:
+            reset_opa(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                value=self.prune_opa * 2.0,
+            )
 
     def _update_state(
         self,
@@ -260,94 +264,134 @@ class Distill2DStrategy(Strategy):
             ]:
                 assert key in info, f"{key} is required but missing."
 
-        # normalize grads to [-1, 1] screen spac
-        if self.key_for_gradient == "rendered_sh_coeffs":
-            grads = info[self.key_for_gradient].grad.clone() * self.sh_coeffs_mult
-            grads = grads.norm(dim=-1)
-        elif self.key_for_gradient == "depths":
-            grads = info[self.key_for_gradient].grad.clone()[..., None] * self.depths_mult
-            grads = grads.norm(dim=-1)
-        elif self.key_for_gradient == "depths_and_sh":
-            sh_grads = info["rendered_sh_coeffs"].grad.clone() * self.sh_coeffs_mult
-            sh_grads_norm = sh_grads.norm(dim=-1)
-            depths_grads = info["depths"].grad.clone()[..., None] * self.depths_mult
-            depths_grads_norm = depths_grads.norm(dim=-1)
-            
-            grads = sh_grads_norm + depths_grads_norm
-
-            # grads = torch.cat([sh_grads, depths_grads[..., None]], dim=-1)
-        else:
-            if self.absgrad:
-                grads = info[self.key_for_gradient].absgrad.clone()
-            else:
-                grads = info[self.key_for_gradient].grad.clone()
-            grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
-            grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
-            grads = grads.norm(dim=-1)
-
-        # initialize state on the first run
-        n_gaussian = len(list(params.values())[0])
-
-
-        if state["grad2d"] is None:
-            state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
-        if state["count"] is None:
-            state["count"] = torch.zeros(n_gaussian, device=grads.device)
-        if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
-            assert "radii" in info, "radii is required but missing."
-            state["radii"] = torch.zeros(n_gaussian, device=grads.device)
+        # normalize grads to [-1, 1] screen space
         
-        if self.use_blur_split:
-            if state["blur_mask"] is None:
-                state["blur_mask"] = torch.zeros(n_gaussian, device=grads.device,)
-            for c in range(info["max_ids"].shape[0]):
-                num_pixels = torch.zeros(n_gaussian, device=grads.device)  # shape of N
-                max_ids = info["max_ids"][c]  # shape of C, H, W
-
-                valid_mask = max_ids >= 0
-
-                max_ids = max_ids % n_gaussian
+        if self.key_for_gradient != "sh_coeffs":
+            if self.key_for_gradient == "rendered_sh_coeffs":
+                grads = info[self.key_for_gradient].grad.clone() * self.sh_coeffs_mult
+            elif self.key_for_gradient == "depths":
+                grads = info[self.key_for_gradient].grad.clone()[..., None] * self.depths_mult
                 
-                num_pixels.index_add_(
-                    0, 
-                    max_ids[valid_mask].flatten(), 
-                    torch.ones_like(max_ids[valid_mask].flatten(), dtype=torch.float32)
-                )
+            elif self.key_for_gradient == "depths_and_sh":
+                sh_grads = info["rendered_sh_coeffs"].grad.clone() * self.sh_coeffs_mult
+                depths_grads = info["depths"].grad.clone() * self.depths_mult
+                
+                grads = torch.cat([sh_grads, depths_grads[..., None]], dim=-1)
+            else:
+                if self.absgrad:
+                    grads = info[self.key_for_gradient].absgrad.clone()
+                else:
+                    grads = info[self.key_for_gradient].grad.clone()
+                grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
+                grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
 
-                state["blur_mask"] = torch.logical_or(
-                    state["blur_mask"], 
-                    num_pixels > (info["width"] * info["height"] * self.blur_threshold)
-                )
-
-        # update the running state
-        if packed:
-            # grads is [nnz, 2]
-            gs_ids = info["gaussian_ids"]  # [nnz]
-            radii = info["radii"]  # [nnz]
-        else:
-            # grads is [C, N, 2]
-            sel = info["radii"] > 0.0  # [C, N]
-            gs_ids = torch.where(sel)[1]  # [nnz]
-            grads = grads[sel]  # [nnz, 2]
-            radii = info["radii"][sel]  # [nnz]
-
-        state["grad2d"].index_add_(0, gs_ids, grads)
+            # initialize state on the first run
+            n_gaussian = len(list(params.values())[0])
 
 
-        if self.key_for_gradient != "means2d":
-            means2d_grad = info["means2d"].grad.clone()
-            means2d_grad[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
-            means2d_grad[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
-            means2d_grad = means2d_grad 
+            if state["grad2d"] is None:
+                state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
+            if state["count"] is None:
+                state["count"] = torch.zeros(n_gaussian, device=grads.device)
+            if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
+                assert "radii" in info, "radii is required but missing."
+                state["radii"] = torch.zeros(n_gaussian, device=grads.device)
+            
+            if self.use_blur_split:
+                if state["blur_mask"] is None:
+                    state["blur_mask"] = torch.zeros(n_gaussian, device=grads.device,)
+                for c in range(info["max_ids"].shape[0]):
+                    num_pixels = torch.zeros(n_gaussian, device=grads.device)  # shape of N
+                    max_ids = info["max_ids"][c]  # shape of C, H, W
 
-            if not packed:
-                means2d_grad = means2d_grad[sel]
-            state["grad2d"].index_add_(0, gs_ids, means2d_grad.norm(dim=-1))
+                    valid_mask = max_ids >= 0
+
+                    max_ids = max_ids % n_gaussian
+                    
+                    num_pixels.index_add_(
+                        0, 
+                        max_ids[valid_mask].flatten(), 
+                        torch.ones_like(max_ids[valid_mask].flatten(), dtype=torch.float32)
+                    )
+
+                    state["blur_mask"] = torch.logical_or(
+                        state["blur_mask"], 
+                        num_pixels > (info["width"] * info["height"] * self.blur_threshold)
+                    )
+
+            # update the running state
+            if packed:
+                # grads is [nnz, 2]
+                gs_ids = info["gaussian_ids"]  # [nnz]
+                radii = info["radii"]  # [nnz]
+            else:
+                # grads is [C, N, 2]
+                sel = info["radii"] > 0.0  # [C, N]
+                gs_ids = torch.where(sel)[1]  # [nnz]
+                grads = grads[sel]  # [nnz, 2]
+                radii = info["radii"][sel]  # [nnz]
+
+            state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
 
 
-        state["count"].index_add_(
-            0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
-        )
+            if self.key_for_gradient != "means2d":
+                means2d_grad = info["means2d"].grad.clone()
+                means2d_grad[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
+                means2d_grad[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
+                means2d_grad = means2d_grad * 0.1
+                if not packed:
+                    means2d_grad = means2d_grad[sel]
+                state["grad2d"].index_add_(0, gs_ids, means2d_grad.norm(dim=-1))
+
+
+            state["count"].index_add_(
+                0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
+            )
+
+        elif self.key_for_gradient == "sh_coeffs":
+            n_gaussian = len(list(params.values())[0])
+            sh0_grads = params['sh0'].grad.clone()
+            shN_grads = params['shN'].grad.clone()
+            sh_grads = torch.cat([sh0_grads.reshape(n_gaussian, -1), shN_grads.reshape(n_gaussian, -1)], dim=-1) * self.sh_coeffs_mult
+            sh_grads = sh_grads.norm(dim=-1)
+
+        
+            # initialize state on the first run
+            n_gaussian = len(list(params.values())[0])
+
+            if state["grad2d"] is None:
+                state["grad2d"] = torch.zeros(n_gaussian, device=sh_grads.device)
+            if state["count"] is None:
+                state["count"] = torch.zeros(n_gaussian, device=sh_grads.device)
+            if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
+                assert "radii" in info, "radii is required but missing."
+                state["radii"] = torch.zeros(n_gaussian, device=sh_grads.device)
+            if self.use_blur_split:
+                if state["blur_mask"] is None:
+                    state["blur_mask"] = torch.zeros(n_gaussian, device=sh_grads.device, )
+                    
+                for c in range(info["max_ids"].shape[0]):
+                    num_pixels = torch.zeros(n_gaussian, device=grads.device)  # shape of N
+                    max_ids = info["max_ids"][c]  # shape of C, H, W
+
+                    valid_mask = max_ids >= 0
+
+                    max_ids = max_ids % n_gaussian
+                    
+                    num_pixels.index_add_(
+                        0, 
+                        max_ids[valid_mask].flatten(), 
+                        torch.ones_like(max_ids[valid_mask].flatten(), dtype=torch.float32)
+                    )
+
+                    state["blur_mask"] = torch.logical_or(
+                        state["blur_mask"], 
+                        num_pixels > (info["width"] * info["height"] * self.blur_threshold)
+                    )
+
+
+            state["grad2d"] += sh_grads
+            state["count"] += 1
 
 
         if self.refine_scale2d_stop_iter > 0:
@@ -357,7 +401,6 @@ class Distill2DStrategy(Strategy):
                 # normalize radii to [0, 1] screen space
                 radii / float(max(info["width"], info["height"])),
             )
-
 
     @torch.no_grad()
     def _grow_gs(
@@ -369,31 +412,12 @@ class Distill2DStrategy(Strategy):
     ) -> Tuple[int, int]:
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
-        grads[count == 0] = 0.0
         device = grads.device
 
-        # 2. Determine the current number of Gaussians
-        n_gaussians = len(params["means"])
-
-        # 3. Compute the remaining number of grow_gs calls.
-        # Since grow_gs is called every `self.refine_every` steps, we compute:
-        calls_left = max(1, (self.refine_stop_iter - step) // self.refine_every)
-        
-        # 4. Calculate how many Gaussians are still needed and determine the ideal increasement per call.
-        gaussians_needed = self.target_num_gaussians - n_gaussians
-        ideal_increase_count = max(1, int(round(gaussians_needed / calls_left)))
-        
-        # 5. Sort gradients in descending order and select the top indices.
-        sorted_indices = torch.argsort(grads, descending=True)
-        top_indices = sorted_indices[:ideal_increase_count]
-        
-        # Create a boolean mask for the selected indices.
-        highest_grad = torch.zeros_like(grads, dtype=torch.bool)
-        highest_grad[top_indices] = True
-
         is_grad_high = grads > self.grow_grad2d
+        if self.use_blur_split:
+            is_grad_high = torch.logical_or(is_grad_high, state["blur_mask"])
 
-        is_grad_high = torch.logical_and(is_grad_high, highest_grad)
 
         is_small = (
             torch.exp(params["scales"]).max(dim=-1).values
@@ -404,14 +428,9 @@ class Distill2DStrategy(Strategy):
 
         is_large = ~is_small
         is_split = is_grad_high & is_large
-
-        if self.use_blur_split:
-            is_split = torch.logical_or(is_split, state["blur_mask"])
-
         if step < self.refine_scale2d_stop_iter:
             is_split |= state["radii"] > self.grow_scale2d
         n_split = is_split.sum().item()
-
 
         # first duplicate
         if n_dupli > 0:

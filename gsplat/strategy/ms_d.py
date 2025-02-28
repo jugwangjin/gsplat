@@ -82,7 +82,7 @@ class MSDStrategy(DefaultStrategy):
     grow_scale2d: float = 0.05
     prune_scale3d: float = 0.1
     prune_scale2d: float = 0.15
-    refine_scale2d_stop_iter: int = 0
+    refine_scale2d_stop_iter: int = 15_000
     refine_start_iter: int = 500
     refine_stop_iter: int = 15_000
     reset_every: int = 3000
@@ -167,18 +167,29 @@ class MSDStrategy(DefaultStrategy):
 
         self._update_state(params, state, info, packed=packed)
 
+        if "depth_reinit_iter" not in info: 
+            info.update({"depth_reinit_iter": False})
+
+        # if "num_max" in info:
+        #     n_gaussian = len(params["means"])
+        #     if info["num_max"] < n_gaussian:
+        #         return
+
         if (
             step > self.refine_start_iter
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
+            and not info["depth_reinit_iter"] 
         ):
-            # grow GSs
-            n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
-            if self.verbose:
-                print(
-                    f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
-                    f"Now having {len(params['means'])} GSs."
-                )
+            n_gaussian = len(params["means"])
+            if not "num_max" in info or n_gaussian < info["num_max"]:
+                # grow GSs
+                n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
+                if self.verbose:
+                    print(
+                        f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
+                        f"Now having {len(params['means'])} GSs."
+                    )
 
             # prune GSs
             n_prune = self._prune_gs(params, optimizers, state, step)
@@ -293,11 +304,13 @@ class MSDStrategy(DefaultStrategy):
     ) -> Tuple[int, int]:
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
+        grads[count == 0] = 0.0
         device = grads.device
 
         is_grad_high = grads > self.grow_grad2d
 
-        is_grad_high = torch.logical_or(is_grad_high, state["blur_mask"])
+        is_grad_high = is_grad_high
+        # is_grad_high = torch.logical_or(is_grad_high, state["blur_mask"])
 
         is_small = (
             torch.exp(params["scales"]).max(dim=-1).values
@@ -308,6 +321,9 @@ class MSDStrategy(DefaultStrategy):
 
         is_large = ~is_small
         is_split = is_grad_high & is_large
+
+        is_split = torch.logical_or(is_split, state["blur_mask"])
+
         if step < self.refine_scale2d_stop_iter:
             is_split |= state["radii"] > self.grow_scale2d
         n_split = is_split.sum().item()

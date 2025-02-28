@@ -361,6 +361,8 @@ class Dataset:
         self.training_centers = all_centers[self.training_indices]
         self.training_kd_tree = KDTree(self.training_centers)
 
+        self.loaded_images = {}
+
 
     def __len__(self):
         return len(self.indices)
@@ -369,7 +371,13 @@ class Dataset:
         index = self.indices[item]
 
         # print(index, self.parser.image_paths[index])
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
+        if index in self.loaded_images:
+            image = self.loaded_images[index]
+        else:
+            image = imageio.imread(self.parser.image_paths[index])[..., :3]
+            self.loaded_images[index] = image
+            
+        # image = imageio.imread(self.parser.image_paths[index])[..., :3]
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]

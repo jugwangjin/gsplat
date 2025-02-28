@@ -38,7 +38,8 @@ def create_splats_and_optimizers_from_data(
     opacities=None,
     optimizers=None,
     keep_feats=False,
-    indices=None
+    indices=None,
+    keep_mean_sh0=False,
 ):
     shN_channels = 15 if runner is None else runner.splats["shN"].shape[1]
 
@@ -101,7 +102,15 @@ def create_splats_and_optimizers_from_data(
             for name, _, lr in params
         }
     else:
-
+        if not keep_feats and keep_mean_sh0:
+            def optimizer_fn(key, v):
+                # shape : [new n gaussians, v shape [1:]]
+                # I don't know the length of v shape
+                if key != "sh0" and key != "means":
+                    num_v = torch.zeros(new_n_gaussians, *v.shape[1:], device=device)
+                    return num_v
+                else:
+                    return v[indices]
         if not keep_feats:
             def optimizer_fn(key, v):
                 # shape : [new n gaussians, v shape [1:]]
@@ -198,6 +207,7 @@ def simplification(
     init_scale: float = 1.0,
     scene_scale: float = 1.0,
     optimizers=None,
+    abs_ratio=False
 ):
     
     trainloader = torch.utils.data.DataLoader(
@@ -241,7 +251,6 @@ def simplification(
             masks=masks,
         )
 
-
         max_ids = info["max_ids"]
 
         max_ids_valid_mask = max_ids >= 0
@@ -262,11 +271,10 @@ def simplification(
         # add importance score to impotance_scores, but only where accumulated_weights_count > 0
         for i in range(accumulated_weights_value.shape[0]):
             importance_score = accumulated_weights_value[i] / (accumulated_weights_count[i].clamp(min=1))
-            accumulated_weights_valid_mask = torch.logical_and(batch_pixels_per_gaussian > 0, accumulated_weights_count[i] > 0)
+            accumulated_weights_valid_mask = batch_pixels_per_gaussian > 0
             importance_scores[accumulated_weights_valid_mask] += importance_score[accumulated_weights_valid_mask]
-
-    zero_pixels_per_gaussian = pixels_per_gaussian == 0
-    importance_scores[zero_pixels_per_gaussian] = 0
+ 
+    importance_scores[pixels_per_gaussian == 0] = 0
 
     if use_cdf_mask:
         sampling_mask = init_cdf_mask(importance_scores, cdf_threshold)
@@ -276,8 +284,10 @@ def simplification(
 
         prob = importance_scores / importance_scores.sum()
         prob = prob.cpu().numpy()
-              
-        n_sample = int(n_gaussian * sampling_factor * ((prob !=0).sum()/prob.shape[0]))
+        if abs_ratio:
+            n_sample = int(n_gaussian * sampling_factor)
+        else:
+            n_sample = int(n_gaussian * sampling_factor * ((prob !=0).sum()/prob.shape[0]))
 
         indices = np.random.choice(n_gaussian, n_sample, p=prob, replace=False)
 
@@ -309,7 +319,7 @@ def simplification(
         opacities=runner.splats["opacities"][indices] if keep_feats else None,
         optimizers=optimizers,
         keep_feats=keep_feats,
-        indices=indices 
+        indices=indices,
     )
 
     return splats, optimizers
@@ -331,7 +341,8 @@ def depth_reinitialization(
         init_num_pts: int = 100_000,
         device: str = "cuda",
         init_type: str = "sfm",
-        optimizers=None
+        optimizers=None,
+        replace=False
 ):
     
     trainloader = torch.utils.data.DataLoader(
@@ -379,12 +390,17 @@ def depth_reinitialization(
         depths = info["max_weight_depth"] # [b, H, W, 1]
         world_coords = depth_to_points(depths=depths, Ks=Ks, camtoworlds=camtoworlds)  # [b, H, W, 3]
         
+
+
         prob = alphas # shape of [b, H, W, 1]
         # prob = 1 - alphas # shape of [b, H, W, 1]
 
         # if info["max_ids"] < 0: prob = 0
         # max_ids = info["max_ids"] # shape of [b, H, W, 1]
         # prob[max_ids < 0] = 0
+
+        # prob to zero where depths < 0
+        prob[depths < 0] = 0
 
         prob = prob / prob.sum() 
         # print(prob.shape, depths.shape, world_coords.shape, alphas.shape)
@@ -395,7 +411,9 @@ def depth_reinitialization(
         N_xyz = prob.shape[0]
         num_sampled = min(N_xyz, int(N_xyz * factor))
 
-        indices = np.random.choice(N_xyz, num_sampled, p=prob, replace=False)
+        indices = np.random.choice(N_xyz, num_sampled, p=prob, replace=replace)
+        if replace: 
+            indices = np.unique(indices)
         
 
         world_coords = world_coords.reshape(-1, 3)
