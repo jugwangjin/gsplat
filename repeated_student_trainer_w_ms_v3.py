@@ -73,6 +73,8 @@ fix_all_seeds(20202464)
 
 @dataclass
 class Config:
+
+    total_repeat: int = 1
     # Disable viewer
     disable_viewer: bool = False
     use_novel_view: bool = False
@@ -1284,7 +1286,18 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         if cfg.compression is not None:
             runner.run_compression(step=step)
     else:
-        runner.train()
+        for rep in range(cfg.total_repeat):
+            print(f"Starting training repetition {rep+1}/{cfg.total_repeat}")
+            # Create a new Runner with the current teacher checkpoint.
+            runner = Runner(local_rank, world_rank, world_size, cfg)
+            runner.train()
+            # After training, save the student model as the new teacher checkpoint.
+            new_teacher_ckpt = f"{cfg.result_dir}/ckpts/final_teacher_round_{rep}.pt"
+            data = {"step": cfg.max_steps, "splats": runner.splats.state_dict()}
+            torch.save(data, new_teacher_ckpt)
+            print(f"Finished repetition {rep+1}. New teacher saved to {new_teacher_ckpt}")
+            # Update the teacher checkpoint for the next round.
+            cfg.teacher_ckpt = new_teacher_ckpt
 
     if not cfg.disable_viewer:
         print("Viewer running... Ctrl+C to exit.")

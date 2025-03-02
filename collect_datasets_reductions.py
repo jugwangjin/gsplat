@@ -42,8 +42,6 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4_SMALL"):
     tokens = rest.split('_')
     
     # Determine if densification token is present.
-    # Expected token order with densification:
-    # 0: blur, 1: novel_view, 2: densify, 3: start, 4: target, then lambdas...
     offset = 0
     if len(tokens) >= 3 and tokens[2].startswith("densify"):
         densify_val = tokens[2][len("densify"):]
@@ -93,7 +91,6 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4_SMALL"):
         params["target_sampling_ratio"] = None
     
     # Next tokens: lambdas.
-    # Token for distill_sh_lambda, e.g. "sh0.25"
     if tokens[start_idx+2].startswith("sh"):
         sh_val = tokens[start_idx+2][len("sh"):]
         try:
@@ -103,7 +100,6 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4_SMALL"):
     else:
         params["distill_sh_lambda"] = tokens[start_idx+2]
     
-    # Token for distill_colors_lambda, e.g. "colors0.25"
     if tokens[start_idx+3].startswith("colors"):
         colors_val = tokens[start_idx+3][len("colors"):]
         try:
@@ -113,7 +109,6 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4_SMALL"):
     else:
         params["distill_colors_lambda"] = tokens[start_idx+3]
     
-    # Token for distill_depth_lambda, e.g. "depth0.25"
     if tokens[start_idx+4].startswith("depth"):
         depth_val = tokens[start_idx+4][len("depth"):]
         try:
@@ -123,7 +118,6 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4_SMALL"):
     else:
         params["distill_depth_lambda"] = tokens[start_idx+4]
     
-    # Token for distill_xyzs_lambda, e.g. "xyzs0.25"
     if tokens[start_idx+5].startswith("xyzs"):
         xyzs_val = tokens[start_idx+5][len("xyzs"):]
         try:
@@ -133,7 +127,6 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4_SMALL"):
     else:
         params["distill_xyzs_lambda"] = tokens[start_idx+5]
     
-    # Token for distill_quats_lambda, e.g. "quats0.25"
     if tokens[start_idx+6].startswith("quats"):
         quats_val = tokens[start_idx+6][len("quats"):]
         try:
@@ -184,7 +177,7 @@ def parse_subdir_name(subdir_name, prefix="bicycle_4_SMALL"):
 
 def group_and_write_csv(results, output_csv_grouped, known_prefixes):
     """
-    Create a new CSV file grouping students by prefix and target sampling ratio.
+    Create a new CSV file grouping student results by prefix and target sampling ratio.
     The CSV has the following columns:
       1. prefix (extracted from the subdirectory name)
       2. target_sampling_ratio
@@ -241,18 +234,15 @@ def group_and_write_csv(results, output_csv_grouped, known_prefixes):
         writer = csv.DictWriter(csvfile, fieldnames=header)
         writer.writeheader()
         
-        # Process each group.
         for group_key in sorted(groups.keys(), key=lambda k: (k[0], k[1])):
             prefix_val, target = group_key
             group_rows = groups[group_key]
-            # Group by model name and select representative row (highest PSNR) for each.
             model_reps = {}
             for row in group_rows:
                 model_name = compute_model_name(row)
                 psnr_val = to_float(row.get("psnr", 0))
                 if model_name not in model_reps or psnr_val > to_float(model_reps[model_name].get("psnr", 0)):
                     model_reps[model_name] = row
-            # Get representative rows and sort them by model name.
             rep_rows = list(model_reps.values())
             rep_rows.sort(key=lambda r: compute_model_name(r))
             for row in rep_rows:
@@ -264,94 +254,85 @@ def group_and_write_csv(results, output_csv_grouped, known_prefixes):
                     "ssim": row.get("ssim", ""),
                     "num_GS": row.get("num_GS", "")
                 })
-            # Insert a blank row to separate groups.
             writer.writerow({col: "" for col in header})
 
-def analyze_students_dir(students_dir, output_csv, prefix="bicycle_4_SMALL"):
+def analyze_dir(base_dir, mode, json_filename, prefix="bicycle_4_SMALL"):
     """
-    Recursively scan the given students_dir for subdirectories that contain a
-    stats/val_step14999.json file. For each valid JSON, read the stats and parse
-    the subdirectory name (using the new training script naming convention) to extract
-    training parameters. Then, fixed teacher reference cases are added from teacher stats files.
+    Scan a given directory for subdirectories that contain a valid stats JSON file.
+    The mode parameter determines whether the directory is for student or teacher runs.
+    
+    For student mode, the subdirectory name is parsed using parse_subdir_name.
+    For teacher mode, a simple teacher type extraction is done based on the subdir name.
     """
     results = []
-    
-    # Process student directories.
-    for root in os.listdir(students_dir):
-        root = os.path.join(students_dir, root)
-        stats_dir = os.path.join(root, "stats")
-        json_file = os.path.join(stats_dir, "val_step14999.json")
-        print(f"Checking: {json_file}")
-        if os.path.exists(json_file):
-            print(f"Found JSON file: {json_file}")
-            subdir_name = os.path.basename(root)
+    for subdir in os.listdir(base_dir):
+        subdir_path = os.path.join(base_dir, subdir)
+        if not os.path.isdir(subdir_path):
+            continue
+        stats_dir = os.path.join(subdir_path, "stats")
+        stats_file = os.path.join(stats_dir, json_filename)
+        if os.path.exists(stats_file):
+            print(f"Found {mode} stats: {stats_file}")
             try:
-                with open(json_file, 'r') as f:
+                with open(stats_file, 'r') as f:
                     stats = json.load(f)
             except Exception as e:
-                print(f"Error reading {json_file}: {e}")
+                print(f"Error reading {stats_file}: {e}")
                 continue
             
-            parsed_params = parse_subdir_name(subdir_name, prefix=prefix)
-            combined = {"subdirectory": subdir_name}
-            combined.update(parsed_params)
-            combined.update(stats)
-            results.append(combined)
+            entry = {"subdirectory": subdir, "mode": mode}
+            if mode == "student":
+                parsed_params = parse_subdir_name(subdir, prefix=prefix)
+                entry.update(parsed_params)
+            elif mode == "teacher":
+                # For teacher directories, extract teacher type from the folder name.
+                teacher_type = ""
+                if "dense" in subdir:
+                    teacher_type = "full"
+                elif "small" in subdir:
+                    teacher_type = "small"
+                entry["teacher_type"] = teacher_type
+            entry.update(stats)
+            results.append(entry)
+    return results
+
+def analyze_training_results(students_dir, teachers_dir, output_csv, prefix):
+    results = []
+    if students_dir and os.path.exists(students_dir):
+        print(f"Analyzing student results in {students_dir}")
+        student_results = analyze_dir(students_dir, "student", "val_step14999.json", prefix=prefix)
+        results.extend(student_results)
+    else:
+        print("No valid students directory provided or directory does not exist.")
     
-    # Add the fixed teacher reference cases.
-    teacher_stats_files = [
-        os.path.join('/Bean/log/gwangjin/2025/kdgs/ms/bicycle_depth_reinit_sampling_0.5/stats/val_step29999.json'),
-        os.path.join('/Bean/log/gwangjin/2025/kdgs/ms_d/bicycle_depth_reinit/stats/val_step29999.json')
-    ]
-    for teacher_stats_file in teacher_stats_files:
-        if os.path.exists(teacher_stats_file):
-            try:
-                with open(teacher_stats_file, 'r') as f:
-                    teacher_stats = json.load(f)
-                teacher_row = {
-                    "subdirectory": "teacher_reference",
-                    "distill_sh_lambda": "",
-                    "distill_colors_lambda": "",
-                    "distill_depth_lambda": "",
-                    "distill_xyzs_lambda": "",
-                    "distill_quats_lambda": "",
-                    "blur": "",
-                    "novel_view": "",
-                    "start_sampling_ratio": "",
-                    "target_sampling_ratio": "",
-                    "densification": "",
-                    "gradient_key": "teacher",
-                    "sh_coeffs_mult": "",
-                    "depths_mult": "",
-                    "grow_grad2d": "",
-                }
-                teacher_row.update(teacher_stats)
-                results.append(teacher_row)
-            except Exception as e:
-                print(f"Error reading teacher stats file {teacher_stats_file}: {e}")
-        else:
-            print(f"Teacher stats file not found: {teacher_stats_file}")
+    if teachers_dir and os.path.exists(teachers_dir):
+        print(f"Analyzing teacher results in {teachers_dir}")
+        teacher_results = analyze_dir(teachers_dir, "teacher", "val_step29999.json", prefix=prefix)
+        results.extend(teacher_results)
+    else:
+        print("No valid teachers directory provided or directory does not exist.")
     
     if not results:
         print("No valid JSON files found.")
         return
+
     def safe_float(val):
         try:
             return float(val)
         except:
             return 0.0
 
-    # Replace the old sort line with this:
     results.sort(key=lambda x: (
-        bool(x.get("novel_view", False)),                                  # True first
-        bool(x.get("densification", False)) if x.get("densification") is not None else False,  # True first
-        safe_float(x.get("target_sampling_ratio", 0)),                      # Higher target_sampling_ratio first
-        safe_float(x.get("psnr", 0)),                                         # Higher PSNR first
-        safe_float(x.get("ssim", 0))                                          # Higher SSIM first
+        x.get("mode", ""),
+        safe_float(x.get("target_sampling_ratio", 0)),
+        safe_float(x.get("psnr", 0)),
+        safe_float(x.get("ssim", 0))
     ), reverse=True)
-    
+
     header = [
         "subdirectory",
+        "mode",
+        "teacher_type",
         "blur",
         "novel_view",
         "densification",
@@ -382,24 +363,28 @@ def analyze_students_dir(students_dir, output_csv, prefix="bicycle_4_SMALL"):
     
     print(f"Analysis complete. Data saved to {output_csv}")
     
-    # Write grouped CSV.
-    grouped_csv = "grouped_results.csv"
-    group_and_write_csv(results, grouped_csv, known_prefixes=[prefix, "bicycle_4_FULL"])
-    print(f"Grouped CSV saved to {grouped_csv}")
+    # For student results, generate a grouped CSV.
+    student_results = [r for r in results if r.get("mode") == "student"]
+    if student_results:
+        grouped_csv = "grouped_student_results.csv"
+        group_and_write_csv(student_results, grouped_csv, known_prefixes=[prefix, "bicycle_4_FULL"])
+        print(f"Grouped student CSV saved to {grouped_csv}")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze student subdirectories for stats and training parameters from val_step29999.json and add teacher reference cases."
+        description="Analyze training results from student and teacher subdirectories."
     )
     parser.add_argument('--students_dir', type=str, default='../gsplat_students_v6', 
                         help="Path to the directory containing student subdirectories")
-    parser.add_argument('--output_csv', type=str, default='reduced_results.csv', 
-                        help="Path to output CSV file (default: reduced_results.csv)")
+    parser.add_argument('--teachers_dir', type=str, default='/Bean/log/gwangjin/2025/kdgs/teachers', 
+                        help="Path to the directory containing teacher subdirectories")
+    parser.add_argument('--output_csv', type=str, default='datasets_combined_results.csv', 
+                        help="Path to output CSV file (default: combined_results.csv)")
     parser.add_argument('--prefix', type=str, default='bicycle_4_SMALL', 
-                        help="Prefix used in subdirectory naming (default: 'bicycle_4_SMALL')")
+                        help="Prefix used in student subdirectory naming (default: 'bicycle_4_SMALL')")
     
     args = parser.parse_args()
-    analyze_students_dir(args.students_dir, args.output_csv, prefix=args.prefix)
+    analyze_training_results(args.students_dir, args.teachers_dir, args.output_csv, args.prefix)
 
 if __name__ == "__main__":
     main()
