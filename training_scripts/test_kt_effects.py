@@ -15,7 +15,7 @@ DATA_FACTOR = 4
 # Directories for teacher and student.
 FULL_TEACHER_CKPT = './gsplat_teachers/bicycle_4_ms/ckpts/ckpt_29999_rank0.pt'
 FULL_TEACHER_DIR = os.path.dirname(os.path.dirname(FULL_TEACHER_CKPT))
-STUDENT_DIR = os.path.join(result_dir_root, 'kt_test_on_ms')
+STUDENT_DIR = os.path.join(result_dir_root, 'kt_test_on_ms2')
 
 max_steps = 10000
 
@@ -44,7 +44,7 @@ def generate_commands():
     use_blur_splits = [True]
     use_novel_views = [True]
     # Target sampling is given as a pair (start, target). We format it as "start-target".
-    target_sampling_pairs = [(0.5, 0.75)]
+    target_sampling_pairs = [(0.7, 0.8)]
     
     # Each combination is a dictionary of lambdas.
     combinations = [
@@ -57,6 +57,7 @@ def generate_commands():
         {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0.25, "distill_scales_lambda": 0, "distill_opacities_lambda": 0},
         {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0.25, "distill_opacities_lambda": 0},
         {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0.25},
+        {"distill_sh_lambda": 0, "distill_colors_lambda": 0.25, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0.25, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0},
 
     ]
     key_for_gradients = ['means2d']
