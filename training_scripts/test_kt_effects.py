@@ -108,7 +108,10 @@ def generate_commands():
                                             f" --distill_colors_lambda {d_colors}"
                                             f" --distill_depth_lambda {d_depth}"
                                             f" --distill_xyzs_lambda {d_xyzs}"
-                                            f" --distill_quats_lambda {d_quats}")
+                                            f" --distill_quats_lambda {d_quats}"
+                                            f" --distill_scales_lambda {d_quats}"
+                                            f" --distill_opacities_lambda {d_quats}"
+                                            )
                                     # Include sh and depth multipliers only if they are nonzero.
                                     if sh_coeffs_mult_val:
                                         cmd += f" --strategy.sh_coeffs_mult {sh_coeffs_mult_val}"
@@ -122,7 +125,7 @@ def generate_commands():
                                         f"{DATASET_NAME}_{DATA_FACTOR}_FULL"
                                         f"_blur{use_blur_split}_novel{use_novel_view}_densify{use_densification}"
                                         f"_start{start_sampling_ratio}_target{target_sampling_ratio}"
-                                        f"_sh{d_sh}_colors{d_colors}_depth{d_depth}_xyzs{d_xyzs}_quats{d_quats}"
+                                        f"_sh{d_sh}_colors{d_colors}_depth{d_depth}_xyzs{d_xyzs}_quats{d_quats}_scales{d_quats}_opacities{d_quats}"
                                         f"_{key}"
                                     )
                                     if sh_coeffs_mult_val:

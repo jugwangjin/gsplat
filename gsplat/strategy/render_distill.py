@@ -307,7 +307,7 @@ class Distill2DStrategy(Strategy):
                 valid_mask = max_ids >= 0
 
                 max_ids = max_ids % n_gaussian
-                
+            
                 num_pixels.index_add_(
                     0, 
                     max_ids[valid_mask].flatten(), 
