@@ -55,7 +55,6 @@ class Config:
     # Render trajectory path
     render_traj_path: str = "interp"
 
-    use_depth_reinit: bool = False
     # depth_reinit_interval: int = 5_000
     depth_reinit_iters: List[int] = field(default_factory=lambda: [5_000, 10_000])
     num_depth: int = 3_500_000
@@ -838,7 +837,7 @@ class Runner:
                     packed=cfg.packed,
                 )
                 
-                if step in cfg.depth_reinit_iters and step < self.cfg.strategy.refine_stop_iter and cfg.use_depth_reinit:
+                if step in cfg.depth_reinit_iters and step < self.cfg.strategy.refine_stop_iter:
                     self.splats, self.optimizers = depth_reinitialization(
                         trainset = self.trainset,
                         num_depth=cfg.num_depth,

@@ -271,16 +271,16 @@ def simplification(
         # add importance score to impotance_scores, but only where accumulated_weights_count > 0
         for i in range(accumulated_weights_value.shape[0]):
             importance_score = accumulated_weights_value[i] / (accumulated_weights_count[i].clamp(min=1))
-            # accumulated_weights_valid_mask = batch_pixels_per_gaussian > 0
-            importance_scores += importance_score
-            # importance_scores[accumulated_weights_valid_mask] += importance_score[accumulated_weights_valid_mask]
+            accumulated_weights_valid_mask = batch_pixels_per_gaussian > 0
+            # importance_scores += importance_score
+            importance_scores[accumulated_weights_valid_mask] += importance_score[accumulated_weights_valid_mask]
  
-    # importance_scores[pixels_per_gaussian == 0] = 0
+    importance_scores[pixels_per_gaussian == 0] = 0
     # print(pixels_per_gaussian.shape, (pixels_per_gaussian==0).sum())
 
     if use_cdf_mask:
-        sampling_mask = init_cdf_mask(importance_scores, cdf_threshold)
-        indices = torch.nonzero(~sampling_mask, as_tuple=True)[0]
+        non_prune_mask = init_cdf_mask(importance_scores, cdf_threshold)
+        indices = torch.nonzero(~non_prune_mask, as_tuple=True)[0]
 
     else:
         prob = importance_scores / importance_scores.sum()
