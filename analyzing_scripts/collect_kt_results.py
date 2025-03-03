@@ -1,12 +1,15 @@
 #!/usr/bin/env python
 import os
 import csv
+import json
 import re
 
 # Path to the student results (change if needed)
 STUDENT_DIR = './gsplat_students/kt_test_on_ms'
 # Name for the output CSV file
 OUTPUT_CSV = 'analysis_results.csv'
+# Set MAX_STEPS as used in training (e.g. 10000)
+MAX_STEPS = 10000
 
 def parse_directory_name(dir_name):
     """
@@ -18,7 +21,6 @@ def parse_directory_name(dir_name):
       _quats{distill_quats}_scales{distill_quats}_opacities{distill_quats}_{key}
       [ _shmult{sh_coeffs_mult} ] [ _depth{depths_mult} ] _grow2d{grow_grad2d}
     """
-    # Split on underscore
     parts = dir_name.split('_')
     config = {}
     try:
@@ -55,27 +57,28 @@ def parse_directory_name(dir_name):
         config['raw_dir_name'] = dir_name
     return config
 
-def read_metrics(results_dir):
+def read_json_metrics(results_dir, max_steps=MAX_STEPS):
     """
-    Look for a results file (e.g. results.txt) in the given directory and
-    parse it to extract metrics.
-    The file is expected to have lines formatted as:
-      MetricName: value
+    Look for a JSON results file (e.g. stats/val_step{max_steps-1}.json) in the given directory and
+    parse it to extract metrics. Only the following keys are extracted:
+      psnr, ssim, lpips, num_GS
     """
-    metrics = {}
-    results_file = os.path.join(results_dir, "results.txt")
-    if os.path.exists(results_file):
-        with open(results_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if ":" in line:
-                    key, value = line.split(":", 1)
-                    metrics[key.strip()] = value.strip()
-    return metrics
+    json_metrics = {}
+    json_file = os.path.join(results_dir, "stats", f"val_step{max_steps - 1}.json")
+    if os.path.exists(json_file):
+        try:
+            with open(json_file, "r") as f:
+                data = json.load(f)
+            # Extract specific metrics if available
+            for key in ["psnr", "ssim", "lpips", "num_GS"]:
+                if key in data:
+                    json_metrics[key] = data[key]
+        except Exception as e:
+            print(f"Error reading {json_file}: {e}")
+    return json_metrics
 
 def main():
     all_rows = []
-    # Loop over each run directory in the student results directory.
     if not os.path.exists(STUDENT_DIR):
         print(f"Directory {STUDENT_DIR} does not exist.")
         return
@@ -83,10 +86,12 @@ def main():
     for entry in os.listdir(STUDENT_DIR):
         run_dir = os.path.join(STUDENT_DIR, entry)
         if os.path.isdir(run_dir):
+            # Parse configuration from directory name
             config = parse_directory_name(entry)
-            metrics = read_metrics(run_dir)
-            # Combine configuration and metric values.
-            row = {**config, **metrics}
+            # Read metrics from the JSON file inside stats/ folder
+            json_metrics = read_json_metrics(run_dir)
+            # Combine configuration and metrics
+            row = {**config, **json_metrics}
             row['run_directory'] = entry
             all_rows.append(row)
 
