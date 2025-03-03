@@ -560,7 +560,7 @@ class Runner(TeacherRunner):
                 yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps 
-        scheduler_max_steps = max_steps * cfg.num_cycles * 2
+        scheduler_max_steps = max_steps
         init_step = 0
 
         schedulers = [
@@ -593,10 +593,6 @@ class Runner(TeacherRunner):
                 )
             )
 
-        for _ in range(scheduler_max_steps // 2):
-            for scheduler in schedulers:
-                scheduler.step()
-
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
@@ -612,6 +608,51 @@ class Runner(TeacherRunner):
 
         for cycle in range(cfg.num_cycles):
             
+
+            for name, optimizer in self.optimizers.items():
+                for i, group in enumerate(optimizer.param_groups):
+                    group["lr"] = self.initial_lr[name][i]
+            if cfg.pose_opt:
+                for i, group in enumerate(self.pose_optimizers[0].param_groups):
+                    group["lr"] = self.initial_lr_pose[i]
+            if cfg.use_bilateral_grid:
+                for i, group in enumerate(self.bil_grid_optimizers[0].param_groups):
+                    group["lr"] = self.initial_lr_bil[i]
+                    
+            max_steps = cfg.max_steps 
+            scheduler_max_steps = max_steps
+            init_step = 0
+
+            schedulers = [
+                # means has a learning rate schedule, that end at 0.01 of the initial value
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.optimizers["means"], gamma=0.01 ** (1.0 / scheduler_max_steps)
+                ),
+            ]
+            if cfg.pose_opt:
+                # pose optimization has a learning rate schedule
+                schedulers.append(
+                    torch.optim.lr_scheduler.ExponentialLR(
+                        self.pose_optimizers[0], gamma=0.01 ** (1.0 / scheduler_max_steps)
+                    )
+                )
+            if cfg.use_bilateral_grid:
+                # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
+                schedulers.append(
+                    torch.optim.lr_scheduler.ChainedScheduler(
+                        [
+                            torch.optim.lr_scheduler.LinearLR(
+                                self.bil_grid_optimizers[0],
+                                start_factor=0.01,
+                                total_iters=1000,
+                            ),
+                            torch.optim.lr_scheduler.ExponentialLR(
+                                self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / scheduler_max_steps)
+                            ),
+                        ]
+                    )
+                )
+
             pbar = tqdm.tqdm(range(init_step, max_steps))
             for step in pbar:
                 if not cfg.disable_viewer:

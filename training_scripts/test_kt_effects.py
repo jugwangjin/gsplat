@@ -160,6 +160,8 @@ def generate_commands():
         {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0.25, "distill_opacities_lambda": 0},
         {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0.25},
         {"distill_sh_lambda": 0, "distill_colors_lambda": 0.25, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0.25, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0},
+        {"distill_sh_lambda": 0.25, "distill_colors_lambda": 0.25, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0.25, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0},
+        {"distill_sh_lambda": 0.25, "distill_colors_lambda": 0.25, "distill_depth_lambda": 0.25, "distill_xyzs_lambda": 0.25, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0},
 
     ]
     key_for_gradients = ['means2d']
