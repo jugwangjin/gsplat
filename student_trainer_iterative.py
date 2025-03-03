@@ -559,20 +559,21 @@ class Runner(TeacherRunner):
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
                 yaml.dump(vars(cfg), f)
 
-        max_steps = cfg.max_steps
+        max_steps = cfg.max_steps 
+        scheduler_max_steps = max_steps * cfg.num_cycles * 2
         init_step = 0
 
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                self.optimizers["means"], gamma=0.01 ** (1.0 / scheduler_max_steps)
             ),
         ]
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
-                    self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                    self.pose_optimizers[0], gamma=0.01 ** (1.0 / scheduler_max_steps)
                 )
             )
         if cfg.use_bilateral_grid:
@@ -586,12 +587,15 @@ class Runner(TeacherRunner):
                             total_iters=1000,
                         ),
                         torch.optim.lr_scheduler.ExponentialLR(
-                            self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                            self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / scheduler_max_steps)
                         ),
                     ]
                 )
             )
 
+        for _ in range(scheduler_max_steps // 2):
+            for scheduler in schedulers:
+                scheduler.step()
 
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
@@ -607,7 +611,7 @@ class Runner(TeacherRunner):
         global_tic = time.time()
 
         for cycle in range(cfg.num_cycles):
-
+            
             pbar = tqdm.tqdm(range(init_step, max_steps))
             for step in pbar:
                 if not cfg.disable_viewer:
@@ -633,7 +637,9 @@ class Runner(TeacherRunner):
                 height, width = pixels.shape[1:3]
 
                 # sh schedule
-                sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+                overall_step = step + cycle * max_steps
+                sh_degree_to_use = cfg.sh_degree
+                # sh_degree_to_use = min(overall_step, cfg.sh_degree)
 
                 if cfg.pose_noise:
                     camtoworlds = self.pose_perturb(camtoworlds, image_ids)
@@ -953,8 +959,8 @@ class Runner(TeacherRunner):
                 for optimizer in self.bil_grid_optimizers:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-                for scheduler in schedulers:
-                    scheduler.step()
+                # for scheduler in schedulers:
+                #     scheduler.step()
 
                 if step % 50 == 0:
                     torch.cuda.empty_cache()
@@ -1022,54 +1028,58 @@ class Runner(TeacherRunner):
 
             # it this was not a last cycle, simplify the model
 
-            if cycle < cfg.num_cycles - 1:
 
-                sampling_n_gaussians = int(cfg.start_sampling_ratio * len(self.splats["means"]))
-                target_n_gaussians = int(cfg.target_sampling_ratio * len(self.splats["means"]))
-                current_n_gaussians = len(self.splats["means"])
-                sampling_factor = min(1, sampling_n_gaussians / current_n_gaussians)
+            sampling_n_gaussians = int(cfg.start_sampling_ratio * len(self.splats["means"]))
+            target_n_gaussians = int(cfg.target_sampling_ratio * len(self.splats["means"]))
+            current_n_gaussians = len(self.splats["means"])
+            sampling_factor = min(1, sampling_n_gaussians / current_n_gaussians)
 
 
-                print(target_n_gaussians, current_n_gaussians, sampling_factor)
-                
-                self.splats, self.optimizers = simplification(
-                    trainset = self.trainset,
-                    runner = self,
-                    parser = self.parser,
-                    cfg = self.cfg,
-                    sampling_factor = sampling_factor,
-                    cdf_threshold = 0.99,
-                    use_cdf_mask = False,
-                    keep_sh0 = True,
-                    keep_feats = True,
-                    batch_size=cfg.batch_size,
-                    sparse_grad=cfg.sparse_grad,
-                    visible_adam=cfg.visible_adam,
-                    world_size=world_size,
-                    init_scale=cfg.init_scale,
-                    scene_scale=self.scene_scale,
-                    abs_ratio = cfg.use_abs_ratio,
+            print(target_n_gaussians, current_n_gaussians, sampling_factor)
+            
+            self.splats, self.optimizers = simplification(
+                trainset = self.trainset,
+                runner = self,
+                parser = self.parser,
+                cfg = self.cfg,
+                sampling_factor = sampling_factor,
+                cdf_threshold = 0.99,
+                use_cdf_mask = False,
+                keep_sh0 = True,
+                keep_feats = True,
+                batch_size=cfg.batch_size,
+                sparse_grad=cfg.sparse_grad,
+                visible_adam=cfg.visible_adam,
+                world_size=world_size,
+                init_scale=cfg.init_scale,
+                scene_scale=self.scene_scale,
+                abs_ratio = cfg.use_abs_ratio,
+            )
+
+            self.target_num_gaussians = target_n_gaussians
+
+            print("Model initialized. Number of GS:", len(self.splats["means"]))
+
+            # Densification Strategy
+            self.cfg.strategy.check_sanity(self.splats, self.optimizers)
+
+            if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, Distill2DStrategy):
+                self.strategy_state = self.cfg.strategy.initialize_state(
+                    scene_scale=self.scene_scale,  target_num_gaussians=self.target_num_gaussians
                 )
+            elif isinstance(self.cfg.strategy, MCMCStrategy):
+                self.strategy_state = self.cfg.strategy.initialize_state()
+            elif isinstance(self.cfg.strategy, DistillationStrategy):   
+                self.strategy_state = self.cfg.strategy.initialize_state()
+                self.cfg.strategy.teacher_sampling_ratio = self.cfg.teacher_sampling_ratio
+            else:
+                assert_never(self.cfg.strategy)
 
-                self.target_num_gaussians = target_n_gaussians
-
-                print("Model initialized. Number of GS:", len(self.splats["means"]))
-
-                # Densification Strategy
-                self.cfg.strategy.check_sanity(self.splats, self.optimizers)
-
-                if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, Distill2DStrategy):
-                    self.strategy_state = self.cfg.strategy.initialize_state(
-                        scene_scale=self.scene_scale,  target_num_gaussians=self.target_num_gaussians
-                    )
-                elif isinstance(self.cfg.strategy, MCMCStrategy):
-                    self.strategy_state = self.cfg.strategy.initialize_state()
-                elif isinstance(self.cfg.strategy, DistillationStrategy):   
-                    self.strategy_state = self.cfg.strategy.initialize_state()
-                    self.cfg.strategy.teacher_sampling_ratio = self.cfg.teacher_sampling_ratio
-                else:
-                    assert_never(self.cfg.strategy)
-
+            
+            total_step = step + cycle * max_steps + 1
+            # eval the full set
+            self.eval(total_step, include_ids=True)
+            self.render_traj(total_step)
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
     if world_size > 1 and not cfg.disable_viewer:

@@ -135,7 +135,7 @@ def generate_commands():
                                         f"{DATASET_NAME}_{DATA_FACTOR}_FULL"
                                         f"_blur{use_blur_split}_novel{use_novel_view}_densify{use_densification}"
                                         f"_start{start_sampling_ratio}_target{target_sampling_ratio}"
-                                        f"_sh{d_sh}_colors{d_colors}_depth{d_depth}_xyzs{d_xyzs}_quats{d_quats}_scales{d_quats}_opacities{d_quats}"
+                                        f"_sh{d_sh}_colors{d_colors}_depth{d_depth}_xyzs{d_xyzs}_quats{d_quats}_scales{d_scales}_opacities{d_opacities}"
                                         f"_{key}"
                                     )
                                     if sh_coeffs_mult_val:
