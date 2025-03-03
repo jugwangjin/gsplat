@@ -39,7 +39,7 @@ def generate_commands():
     commands = []
 
     # Define lists of options.
-    use_blur_splits = [False]
+    use_blur_splits = [True]
     use_novel_views = [False]
     # Target sampling is given as a pair (start, target). We format it as "start-target".
     target_sampling_pairs = [(0.7, 0.8)]
