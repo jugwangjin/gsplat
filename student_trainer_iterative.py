@@ -79,6 +79,7 @@ class Config:
     # Disable viewer
     disable_viewer: bool = True
     use_novel_view: bool = True
+    novel_view_weight: float = 0.25
     teacher_ckpt: str = None
     # The teacher's sampling ratio. If 0.1, the 10% of the teacher's GSs are used for the student.
     start_sampling_ratio: float = 0.75

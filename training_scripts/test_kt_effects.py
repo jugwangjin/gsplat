@@ -13,9 +13,9 @@ DATA_FACTOR = 4
 
 
 # Directories for teacher and student.
-FULL_TEACHER_CKPT = './gsplat_teachers/bicycle_4/ckpts/ckpt_29999_rank0.pt'
+FULL_TEACHER_CKPT = './gsplat_teachers/bicycle_4_ms/ckpts/ckpt_29999_rank0.pt'
 FULL_TEACHER_DIR = os.path.dirname(os.path.dirname(FULL_TEACHER_CKPT))
-STUDENT_DIR = os.path.join(result_dir_root, 'kt_test')
+STUDENT_DIR = os.path.join(result_dir_root, 'kt_test_on_ms')
 
 max_steps = 10000
 
@@ -50,6 +50,14 @@ def generate_commands():
     combinations = [
         {"distill_sh_lambda": 0.25, "distill_colors_lambda": 0.25, "distill_depth_lambda": 0.25, "distill_xyzs_lambda": 0.25, "distill_quats_lambda": 0.25, "distill_scales_lambda": 0.25, "distill_opacities_lambda": 0.25},
         {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0},
+        {"distill_sh_lambda": 0.25, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0},
+        {"distill_sh_lambda": 0, "distill_colors_lambda": 0.25, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0},
+        {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0.25, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0},
+        {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0.25, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0},
+        {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0.25, "distill_scales_lambda": 0, "distill_opacities_lambda": 0},
+        {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0.25, "distill_opacities_lambda": 0},
+        {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0.25},
+
     ]
     key_for_gradients = ['means2d']
     # Even if there is only one value here, we include it to be explicit.
