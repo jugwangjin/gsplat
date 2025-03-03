@@ -79,6 +79,8 @@ def generate_commands():
                         d_depth = comb["distill_depth_lambda"]
                         d_xyzs = comb["distill_xyzs_lambda"]
                         d_quats = comb["distill_quats_lambda"]
+                        d_scales = comb["distill_scales_lambda"]
+                        d_opacities = comb["distill_opacities_lambda"]
                         for key in key_for_gradients:
                             # Filter out an invalid option: if all lambdas are zero and key is 'rendered_sh_coeffs'
                             if (d_sh == 0) and (key == 'rendered_sh_coeffs' or key == 'depths_and_sh'):
@@ -117,8 +119,8 @@ def generate_commands():
                                             f" --distill_depth_lambda {d_depth}"
                                             f" --distill_xyzs_lambda {d_xyzs}"
                                             f" --distill_quats_lambda {d_quats}"
-                                            f" --distill_scales_lambda {d_quats}"
-                                            f" --distill_opacities_lambda {d_quats}"
+                                            f" --distill_scales_lambda {d_scales}"
+                                            f" --distill_opacities_lambda {d_opacities}"
                                             )
                                     # Include sh and depth multipliers only if they are nonzero.
                                     if sh_coeffs_mult_val:
