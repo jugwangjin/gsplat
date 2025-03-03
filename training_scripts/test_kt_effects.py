@@ -146,7 +146,7 @@ def generate_commands():
                                     output_dir = os.path.join(STUDENT_DIR, output_dir_name)
                                     cmd += f" --result_dir {output_dir}"
 
-                                    if not os.path.exists(os.path.join(output_dir, 'ckpts', f'ckpt_{max_steps-1}_rank0.pt')):
+                                    if d_scales > 0 or d_opacities > 0 or not os.path.exists(os.path.join(output_dir, 'ckpts', f'ckpt_{max_steps-1}_rank0.pt')):
                                         commands.append(cmd)
 
 
