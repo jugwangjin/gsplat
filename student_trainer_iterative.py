@@ -399,7 +399,7 @@ class Runner(TeacherRunner):
         for k in teacher_ckpt["splats"].keys():
             self.splats[k] = torch.nn.Parameter(teacher_ckpt["splats"][k].to(self.device).data)
 
-        target_n_gaussians = int(cfg.start_sampling_ratio * len(self.splats["means"]))
+        target_n_gaussians = int(cfg.start_sampling_ratio * len(self.teacher_splats["means"]))
         current_n_gaussians = len(self.splats["means"])
         sampling_factor = min(1, target_n_gaussians / current_n_gaussians)
 
@@ -1023,11 +1023,11 @@ class Runner(TeacherRunner):
             # it this was not a last cycle, simplify the model
 
             if cycle < cfg.num_cycles - 1:
-                self.teacher_splats = self.splats
 
-                target_n_gaussians = int(cfg.start_sampling_ratio * len(self.splats["means"]))
+                sampling_n_gaussians = int(cfg.start_sampling_ratio * len(self.splats["means"]))
+                target_n_gaussians = int(cfg.target_sampling_ratio * len(self.splats["means"]))
                 current_n_gaussians = len(self.splats["means"])
-                sampling_factor = min(1, target_n_gaussians / current_n_gaussians)
+                sampling_factor = min(1, sampling_n_gaussians / current_n_gaussians)
 
 
                 print(target_n_gaussians, current_n_gaussians, sampling_factor)
@@ -1051,7 +1051,7 @@ class Runner(TeacherRunner):
                     abs_ratio = cfg.use_abs_ratio,
                 )
 
-                self.target_num_gaussians = int(cfg.target_sampling_ratio * len(self.teacher_splats["means"]))
+                self.target_num_gaussians = target_n_gaussians
 
                 print("Model initialized. Number of GS:", len(self.splats["means"]))
 
