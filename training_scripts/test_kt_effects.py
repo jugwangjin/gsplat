@@ -170,7 +170,7 @@ def generate_commands():
     grow_grad2ds = [0.0002]
     # start_sampling_ratio: float = 0.75
 
-    use_densifications = [True]   
+    use_densifications = [True, False]   
 
     # target_sampling_ratio: float = 0.9
     for use_densification in use_densifications:
