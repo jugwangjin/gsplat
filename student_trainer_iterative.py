@@ -760,28 +760,25 @@ class Runner(TeacherRunner):
                     bkgd = torch.rand(1, 3, device=device)
                     colors = colors + bkgd * (1.0 - alphas)
 
+                # if novel_view, multiply the novel view dimensions by 0.2, to reduce the weight of the novel view
+                if cfg.use_novel_view:
+                    colors[-cfg.batch_size:] *= cfg.novel_view_weight
+                    depths[-cfg.batch_size:] *= cfg.novel_view_weight
 
-            # if novel_view, multiply the novel view dimensions by 0.2, to reduce the weight of the novel view
-            if cfg.use_novel_view:
-                colors[-cfg.batch_size:] *= cfg.novel_view_weight
-                depths[-cfg.batch_size:] *= cfg.novel_view_weight
+                    pixels[-cfg.batch_size:] *= cfg.novel_view_weight
+                    teacher_rgb[-cfg.batch_size:] *= cfg.novel_view_weight
+                    teacher_depths[-cfg.batch_size:] *= cfg.novel_view_weight
 
-                pixels[-cfg.batch_size:] *= cfg.novel_view_weight
-                teacher_rgb[-cfg.batch_size:] *= cfg.novel_view_weight
-                teacher_depths[-cfg.batch_size:] *= cfg.novel_view_weight
+                    if cfg.distill:
+                        xyzs[-cfg.batch_size:] *= cfg.novel_view_weight
+                        quats[-cfg.batch_size:] *= cfg.novel_view_weight
+                        sh[-cfg.batch_size:] *= cfg.novel_view_weight
 
-                if cfg.distill:
-                    xyzs[-cfg.batch_size:] *= cfg.novel_view_weight
-                    quats[-cfg.batch_size:] *= cfg.novel_view_weight
-                    sh[-cfg.batch_size:] *= cfg.novel_view_weight
+                        teacher_xyzs[-cfg.batch_size:] *= cfg.novel_view_weight
+                        teacher_quats[-cfg.batch_size:] *= cfg.novel_view_weight
+                        teacher_sh[-cfg.batch_size:] *= cfg.novel_view_weight
 
-                    teacher_xyzs[-cfg.batch_size:] *= cfg.novel_view_weight
-                    teacher_quats[-cfg.batch_size:] *= cfg.novel_view_weight
-                    teacher_sh[-cfg.batch_size:] *= cfg.novel_view_weight
-
-
-    
-                # loss
+                    # loss
                 l1loss = F.l1_loss(colors, pixels)
                 ssimloss = 1.0 - fused_ssim(
                     colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
@@ -811,7 +808,6 @@ class Runner(TeacherRunner):
 
                     shloss = F.l1_loss(sh.sum(dim=-1) /3., teacher_sh.sum(dim=-1)/3.) * cfg.distill_sh_lambda
                     loss += shloss
-
 
                 if cfg.use_bilateral_grid:
                     tvloss = 10 * total_variation_loss(self.bil_grids.grids)
