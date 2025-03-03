@@ -954,10 +954,10 @@ class Runner:
             tic = time.time()
 
             render_mode = 'RGB'
-            if include_ids:
-                render_mode += '+IW'
+            # if include_ids:
+            #     render_mode += '+IW'
 
-            colors, _, info = self.rasterize_splats(
+            colors, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -975,8 +975,11 @@ class Runner:
             canvas_list = [pixels, colors]
 
             if include_ids:
-                max_ids_img = visualize_id_maps(info['max_ids'][..., -1])
-                canvas_list.append(max_ids_img)                
+                alphas = alphas.repeat(1,1,1,3).clamp(0.0, 1.0)
+                canvas_list.append(alphas)
+                print("alphas:", alphas.min(), alphas.max(), alphas.mean(), alphas.std())
+                # max_ids_img = visualize_id_maps(info['max_ids'][..., -1])
+                # canvas_list.append(max_ids_img)                
 
             print("write images")
             if world_rank == 0:

@@ -130,3 +130,6 @@ results
 *.ply
 *.png
 *.xlsx
+
+gsplat_teacher*
+gsplat_student*

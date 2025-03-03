@@ -40,9 +40,32 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy, DistillationStrategy, Distill2DStrategy
 from gsplat.optimizers import SelectiveAdam
 from gsplat.utils import save_ply
 
+import random
+
+def fix_all_seeds(seed: int = 42):
+    # Python random module
+    random.seed(seed)
+    
+    # NumPy
+    np.random.seed(seed)
+    
+    # PyTorch CPU and CUDA seeds
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    
+    # For hash-based functions in Python (like set or dict order)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    # # Make cuDNN deterministic and disable benchmark to ensure reproducibility
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+
+fix_all_seeds(20202464)
 
 @dataclass
 class Config:
@@ -455,27 +478,29 @@ class Runner:
         width: int,
         height: int,
         masks: Optional[Tensor] = None,
+        splats = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
+        splats = self.splats if splats is None else splats
+        means = splats["means"]  # [N, 3]
+        # quats = F.normalize(splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        quats = splats["quats"]  # [N, 4]
+        scales = torch.exp(splats["scales"])  # [N, 3]
+        opacities = torch.sigmoid(splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
             colors = self.app_module(
-                features=self.splats["features"],
+                features=splats["features"],
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
                 sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
             )
-            colors = colors + self.splats["colors"]
+            colors = colors + splats["colors"]
             colors = torch.sigmoid(colors)
         else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+            colors = torch.cat([splats["sh0"], splats["shN"]], 1)  # [N, K, 3]
 
         rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
 
@@ -492,7 +517,7 @@ class Runner:
             packed=self.cfg.packed,
             absgrad=(
                 self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
+                if (isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, Distill2DStrategy))
                 else False
             ),
             sparse_grad=self.cfg.sparse_grad,
@@ -875,10 +900,10 @@ class Runner:
             tic = time.time()
 
             render_mode = 'RGB'
-            if include_ids:
-                render_mode += '+IW'
+            # if include_ids:
+            #     render_mode += '+IW'
 
-            colors, _, info = self.rasterize_splats(
+            colors, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -896,8 +921,10 @@ class Runner:
             canvas_list = [pixels, colors]
 
             if include_ids:
-                max_ids_img = visualize_id_maps(info['max_ids'][..., -1])
-                canvas_list.append(max_ids_img)                
+                alphas = alphas.repeat(1,1,1,3).clamp(0.0, 1.0)
+                canvas_list.append(alphas)
+                # max_ids_img = visualize_id_maps(info['max_ids'][..., -1])
+                # canvas_list.append(max_ids_img)                          
 
             print("write images")
             if world_rank == 0:
