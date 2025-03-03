@@ -79,6 +79,7 @@ class Config:
     # Disable viewer
     disable_viewer: bool = True
     use_novel_view: bool = True
+    novel_view_weight: float = 0.25
     teacher_ckpt: str = None
     # The teacher's sampling ratio. If 0.1, the 10% of the teacher's GSs are used for the student.
     start_sampling_ratio: float = 0.75
@@ -755,6 +756,26 @@ class Runner(TeacherRunner):
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
+
+            # if novel_view, multiply the novel view dimensions by 0.2, to reduce the weight of the novel view
+            if cfg.use_novel_view:
+                colors[-cfg.batch_size:] *= cfg.novel_view_weight
+                depths[-cfg.batch_size:] *= cfg.novel_view_weight
+
+                pixels[-cfg.batch_size:] *= cfg.novel_view_weight
+                teacher_rgb[-cfg.batch_size:] *= cfg.novel_view_weight
+                teacher_depths[-cfg.batch_size:] *= cfg.novel_view_weight
+
+                if cfg.distill:
+                    xyzs[-cfg.batch_size:] *= cfg.novel_view_weight
+                    quats[-cfg.batch_size:] *= cfg.novel_view_weight
+                    sh[-cfg.batch_size:] *= cfg.novel_view_weight
+
+                    teacher_xyzs[-cfg.batch_size:] *= cfg.novel_view_weight
+                    teacher_quats[-cfg.batch_size:] *= cfg.novel_view_weight
+                    teacher_sh[-cfg.batch_size:] *= cfg.novel_view_weight
+
+
     
             # loss
             l1loss = F.l1_loss(colors, pixels)
@@ -791,6 +812,9 @@ class Runner(TeacherRunner):
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
+
+            if cfg.use_novel_view:
+                loss = loss * (cfg.novel_view_weight + 1) # to balance the loss of the novel view
 
             # regularizations
             if cfg.opacity_reg > 0.0:

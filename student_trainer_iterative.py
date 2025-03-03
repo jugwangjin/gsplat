@@ -760,7 +760,27 @@ class Runner(TeacherRunner):
                     bkgd = torch.rand(1, 3, device=device)
                     colors = colors + bkgd * (1.0 - alphas)
 
-        
+
+            # if novel_view, multiply the novel view dimensions by 0.2, to reduce the weight of the novel view
+            if cfg.use_novel_view:
+                colors[-cfg.batch_size:] *= cfg.novel_view_weight
+                depths[-cfg.batch_size:] *= cfg.novel_view_weight
+
+                pixels[-cfg.batch_size:] *= cfg.novel_view_weight
+                teacher_rgb[-cfg.batch_size:] *= cfg.novel_view_weight
+                teacher_depths[-cfg.batch_size:] *= cfg.novel_view_weight
+
+                if cfg.distill:
+                    xyzs[-cfg.batch_size:] *= cfg.novel_view_weight
+                    quats[-cfg.batch_size:] *= cfg.novel_view_weight
+                    sh[-cfg.batch_size:] *= cfg.novel_view_weight
+
+                    teacher_xyzs[-cfg.batch_size:] *= cfg.novel_view_weight
+                    teacher_quats[-cfg.batch_size:] *= cfg.novel_view_weight
+                    teacher_sh[-cfg.batch_size:] *= cfg.novel_view_weight
+
+
+    
                 # loss
                 l1loss = F.l1_loss(colors, pixels)
                 ssimloss = 1.0 - fused_ssim(
@@ -796,6 +816,9 @@ class Runner(TeacherRunner):
                 if cfg.use_bilateral_grid:
                     tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                     loss += tvloss
+
+                if cfg.use_novel_view:
+                    loss = loss * (cfg.novel_view_weight + 1) # to balance the loss of the novel view
 
                 # regularizations
                 if cfg.opacity_reg > 0.0:
@@ -971,33 +994,34 @@ class Runner(TeacherRunner):
             torch.save(
                 data, f"{self.ckpt_dir}/ckpt_{total_step}_rank{self.world_rank}.pt"
             )
-        if (
-            cfg.save_ply
-        ):
-            rgb = None
-            if self.cfg.app_opt:
-                # eval at origin to bake the appeareance into the colors
-                rgb = self.app_module(
-                    features=self.splats["features"],
-                    embed_ids=None,
-                    dirs=torch.zeros_like(self.splats["means"][None, :, :]),
-                    sh_degree=sh_degree_to_use,
-                )
-                rgb = rgb + self.splats["colors"]
-                rgb = torch.sigmoid(rgb).squeeze(0)
+            
+            if (
+                cfg.save_ply
+            ):
+                rgb = None
+                if self.cfg.app_opt:
+                    # eval at origin to bake the appeareance into the colors
+                    rgb = self.app_module(
+                        features=self.splats["features"],
+                        embed_ids=None,
+                        dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                        sh_degree=sh_degree_to_use,
+                    )
+                    rgb = rgb + self.splats["colors"]
+                    rgb = torch.sigmoid(rgb).squeeze(0)
 
-            save_ply(self.splats, f"{self.ply_dir}/point_cloud_{total_step}.ply", rgb)
+                save_ply(self.splats, f"{self.ply_dir}/point_cloud_{total_step}.ply", rgb)
 
-            if not cfg.disable_viewer:
-                self.viewer.lock.release()
-                num_train_steps_per_sec = 1.0 / (time.time() - tic)
-                num_train_rays_per_sec = (
-                    num_train_rays_per_step * num_train_steps_per_sec
-                )
-                # Update the viewer state.
-                self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
-                # Update the scene.
-                self.viewer.update(total_step, num_train_rays_per_step)
+                if not cfg.disable_viewer:
+                    self.viewer.lock.release()
+                    num_train_steps_per_sec = 1.0 / (time.time() - tic)
+                    num_train_rays_per_sec = (
+                        num_train_rays_per_step * num_train_steps_per_sec
+                    )
+                    # Update the viewer state.
+                    self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
+                    # Update the scene.
+                    self.viewer.update(total_step, num_train_rays_per_step)
 
             # it this was not a last cycle, simplify the model
 
