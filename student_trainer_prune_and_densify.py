@@ -204,9 +204,11 @@ class Config:
     distill_depth_lambda: float = 1e-1
     distill_xyzs_lambda: float = 1e-1    
     distill_quats_lambda: float = 1e-1    
+    distill_scales_lambda: float = 1e-1
+    distill_opacities_lambda: float = 1e-1
     distill_sh_lambda: float = 1e-1
-    distill_sh0_lambda: float = 1e-1
-    distill_shN_lambda: float = 1e-1
+    
+    
 
 
     # Dump information to tensorboard every this steps
@@ -398,27 +400,8 @@ class Runner(TeacherRunner):
         current_n_gaussians = len(self.splats["means"])
         sampling_factor = min(1, target_n_gaussians / current_n_gaussians)
 
-        if cfg.lpips_net == "alex":
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="alex", normalize=True
-            ).to(self.device)
-        elif cfg.lpips_net == "vgg":
-            # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="vgg", normalize=False
-            ).to(self.device)
-        else:
-            raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
-
 
         print(target_n_gaussians, current_n_gaussians, sampling_factor)
-        
-
-        # Losses & Metrics.
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
-        self.eval(step=0, include_ids=True)
-
         
         self.splats, self.optimizers = simplification(
             trainset = self.trainset,
@@ -438,8 +421,6 @@ class Runner(TeacherRunner):
             scene_scale=self.scene_scale,
             abs_ratio = cfg.use_abs_ratio,
         )
-
-        self.eval(step=1, include_ids=True)
 
         self.target_num_gaussians = int(cfg.target_sampling_ratio * len(self.teacher_splats["means"]))
 
@@ -557,6 +538,8 @@ class Runner(TeacherRunner):
                         cfg.distill_depth_lambda > 0.0 or \
                         cfg.distill_xyzs_lambda > 0.0 or \
                         cfg.distill_quats_lambda > 0.0 or \
+                        cfg.distill_scales_lambda > 0.0 or \
+                        cfg.distill_opacities_lambda > 0.0 or \
                         cfg.distill_sh_lambda > 0.0 
                         # cfg.distill_sh0_lambda > 0.0 or \
                         # cfg.distill_shN_lambda > 0.0
@@ -672,7 +655,9 @@ class Runner(TeacherRunner):
                 teacher_rgb = teacher_renders[..., 0:3].detach().data # [1, H, W, 3]
                 teacher_xyzs = teacher_renders[..., 3:6].detach().data # [1, H, W, 3]
                 teacher_quats = teacher_renders[..., 6:10].detach().data # [1, H, W, 4]
-                teacher_sh = teacher_renders[..., 10:-1].detach().data # [1, H, W, k*3]
+                teacher_scales = teacher_renders[..., 10:13].detach().data # [1, H, W, k*3]
+                teacher_opacities = teacher_renders[..., 13:14].detach().data # [1, H, W, 1]
+                teacher_sh = teacher_renders[..., 14:-1].detach().data # [1, H, W, k*3]
                 teacher_depths = teacher_renders[..., -1:].detach().data # [1, H, W, 1]
 
                 del teacher_renders
@@ -701,7 +686,9 @@ class Runner(TeacherRunner):
                     teacher_rgb_ = teacher_renders[..., 0:3].detach().data # [1, H, W, 3]
                     teacher_xyzs_ = teacher_renders[..., 3:6].detach().data # [1, H, W, 3]
                     teacher_quats_ = teacher_renders[..., 6:10].detach().data # [1, H, W, 4]
-                    teacher_sh_ = teacher_renders[..., 10:-1].detach().data # [1, H, W, k*3]
+                    teacher_scales_ = teacher_renders[..., 10:13].detach().data # [1, H, W, k*3]
+                    teacher_opacities_ = teacher_renders[..., 13:14].detach().data # [1, H, W, 1]
+                    teacher_sh_ = teacher_renders[..., 14:-1].detach().data # [1, H, W, k*3]
                     teacher_depths_ = teacher_renders[..., -1:].detach().data # [1, H, W, 1]
 
                     del teacher_renders
@@ -713,6 +700,8 @@ class Runner(TeacherRunner):
                     teacher_rgb = torch.cat([teacher_rgb, teacher_rgb_], dim=0)
                     teacher_xyzs = torch.cat([teacher_xyzs, teacher_xyzs_], dim=0)
                     teacher_quats = torch.cat([teacher_quats, teacher_quats_], dim=0)
+                    teacher_scales = torch.cat([teacher_scales, teacher_scales_], dim=0)
+                    teacher_opacities = torch.cat([teacher_opacities, teacher_opacities_], dim=0)
                     teacher_sh = torch.cat([teacher_sh, teacher_sh_], dim=0)
                     teacher_depths = torch.cat([teacher_depths, teacher_depths_], dim=0)
 
@@ -740,7 +729,10 @@ class Runner(TeacherRunner):
             if cfg.distill:
                 xyzs = renders[..., 3:6]
                 quats = renders[..., 6:10]
-                sh = renders[..., 10:-1]
+                scales = renders[..., 10:13]
+                opacities = renders[..., 13:14]
+                sh = renders[..., 14:-1]
+
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -786,6 +778,11 @@ class Runner(TeacherRunner):
                 quatloss = F.l1_loss(quats, teacher_quats) * cfg.distill_quats_lambda
                 loss += quatloss
 
+                scaleloss = F.l1_loss(scales, teacher_scales) * cfg.distill_scales_lambda
+                loss += scaleloss
+
+                opacityloss = F.l1_loss(opacities, teacher_opacities) * cfg.distill_opacities_lambda
+                loss += opacityloss
 
                 shloss = F.l1_loss(sh.sum(dim=-1) /3., teacher_sh.sum(dim=-1)/3.) * cfg.distill_sh_lambda
                 loss += shloss
@@ -818,17 +815,21 @@ class Runner(TeacherRunner):
                 desc += f"pose err={pose_err.item():.6f}| "
             if cfg.distill:
                 if cfg.distill_colors_lambda > 0.0:
-                    desc += f"colorloss={colorloss.item():.3f}| "
+                    desc += f"col={colorloss.item():.3f}| "
                 if cfg.distill_depth_lambda > 0.0:
-                    desc += f"depthloss={depthloss.item():.3f}| "
+                    desc += f"dep={depthloss.item():.3f}| "
                 if cfg.distill_xyzs_lambda > 0.0:
-                    desc += f"xyzloss={xyzloss.item():.3f}| "
+                    desc += f"xyz={xyzloss.item():.3f}| "
                 if cfg.distill_quats_lambda > 0.0:
-                    desc += f"quatloss={quatloss.item():.3f}| "
+                    desc += f"qua={quatloss.item():.3f}| "
+                if cfg.distill_scales_lambda > 0.0:
+                    desc += f"sca={scaleloss.item():.3f}| "
+                if cfg.distill_opacities_lambda > 0.0:
+                    desc += f"op={opacityloss.item():.3f}| "
                 if cfg.distill_sh_lambda > 0.0:
-                    desc += f"shloss={shloss.item():.3f}| "
+                    desc += f"sh={shloss.item():.3f}| "
             key_for_gradient = self.cfg.strategy.key_for_gradient
-            desc += f"key = {key_for_gradient}|"
+            desc += f"key = {key_for_gradient[:3]}|"
 
             pbar.set_description(desc)
 

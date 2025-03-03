@@ -483,16 +483,14 @@ def rasterization(
         xyzs = means.unsqueeze(0).repeat(C, 1, 1) # shape of N, 3
         quats = quats.unsqueeze(0).repeat(C, 1, 1) # shape of N, 4
         scales = scales.unsqueeze(0).repeat(C, 1, 1) # shape of N, 3
-        opacities = opacities.unsqueeze(0).unsqueeze(2).repeat(C, 1, 1) # shape of N
-        colors = torch.cat((rgbs, xyzs, quats, scales, opacities, sh_coeffs, depths[..., None]), dim=-1) # shape of N, 3+4+1+3+k*3+1, 
+        colors = torch.cat((rgbs, xyzs, quats, scales, opacities[..., None], sh_coeffs, depths[..., None]), dim=-1) # shape of N, 3+4+1+3+k*3+1, 
 
     elif render_mode in ["NS"]:
         rgbs = colors # shape of N, 3
         xyzs = means.unsqueeze(0).repeat(C, 1, 1) # shape of N, 3
         quats = quats.unsqueeze(0).repeat(C, 1, 1) # shape of N, 4
         scales = scales.unsqueeze(0).repeat(C, 1, 1)
-        opacities = opacities.unsqueeze(0).unsqueeze(2).repeat(C, 1, 1) # shape of N
-        colors = torch.cat((rgbs, xyzs, quats, scales, opacities, sh_coeffs), dim=-1)
+        colors = torch.cat((rgbs, xyzs, quats, scales, opacities[..., None], sh_coeffs), dim=-1)
 
     elif render_mode in ["RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW"]:
         colors = torch.cat((colors, depths[..., None]), dim=-1)
