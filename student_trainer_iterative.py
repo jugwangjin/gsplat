@@ -606,6 +606,16 @@ class Runner(TeacherRunner):
         # Training loop.
         global_tic = time.time()
 
+
+        self.initial_lr = {}
+        for name, optimizer in self.optimizers.items():
+            self.initial_lr[name] = [group["lr"] for group in optimizer.param_groups]
+        if cfg.pose_opt:
+            self.initial_lr_pose = [group["lr"] for group in self.pose_optimizers[0].param_groups]
+        if cfg.use_bilateral_grid:
+            self.initial_lr_bil = [group["lr"] for group in self.bil_grid_optimizers[0].param_groups]
+
+
         for cycle in range(cfg.num_cycles):
             
 
@@ -618,7 +628,7 @@ class Runner(TeacherRunner):
             if cfg.use_bilateral_grid:
                 for i, group in enumerate(self.bil_grid_optimizers[0].param_groups):
                     group["lr"] = self.initial_lr_bil[i]
-                    
+
             max_steps = cfg.max_steps 
             scheduler_max_steps = max_steps
             init_step = 0
@@ -1000,8 +1010,8 @@ class Runner(TeacherRunner):
                 for optimizer in self.bil_grid_optimizers:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-                # for scheduler in schedulers:
-                #     scheduler.step()
+                for scheduler in schedulers:
+                    scheduler.step()
 
                 if step % 50 == 0:
                     torch.cuda.empty_cache()
