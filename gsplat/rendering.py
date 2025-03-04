@@ -530,8 +530,6 @@ def rasterization(
     # print("rank", world_rank, "Before isect_offset_encode")
     isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
 
-    print(tiles_per_gauss.shape, isect_ids.shape, flatten_ids.shape, isect_offsets.shape)
-
     meta.update(
         {
             "tile_width": tile_width,
@@ -602,7 +600,7 @@ def rasterization(
             backgrounds=backgrounds,
             packed=packed,
             absgrad=absgrad,
-            gt_image=gt_image,  
+            gt_image=gt_image if gt_image is not None else None,  
         )
 
 

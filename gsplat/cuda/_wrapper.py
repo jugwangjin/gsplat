@@ -922,8 +922,10 @@ class _RasterizeToPixels(torch.autograd.Function):
         isect_offsets: Tensor,  # [C, tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
         absgrad: bool,
-        gt_image: Optional[Tensor],
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        gt_image: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        
+        print(means2d.dtype, conics.dtype, colors.dtype, opacities.dtype, isect_offsets.dtype, flatten_ids.dtype)
         render_colors, render_alphas, last_ids, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths, accumulated_potential_loss = _make_lazy_cuda_func(
             "rasterize_to_pixels_fwd"
         )(
@@ -1031,6 +1033,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_colors,
             v_opacities,
             v_backgrounds,
+            None,
             None,
             None,
             None,

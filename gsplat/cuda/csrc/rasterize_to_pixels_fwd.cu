@@ -5,7 +5,7 @@
 #include <cuda_runtime.h>
 #include <math_functions.h>
 
-#define MAX_RANGE 1024
+#define MAX_RANGE 4096
 
 namespace gsplat {
 
@@ -267,7 +267,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             S cur_color_loss[COLOR_DIM];
             // calculate L1 loss (abs) for each channel between pix_out and gt_image
             for (uint32_t k = 0; k < COLOR_DIM; ++k) {
-                cur_color_loss[k] = fabs(render_colors[pix_id * COLOR_DIM + k] - gt_image[pix_id * COLOR_DIM + k]);
+                S diff = render_colors[pix_id * COLOR_DIM + k] - gt_image[pix_id * COLOR_DIM + k];
+                cur_color_loss[k] += diff >= 0 ? diff : -diff;
             }
 
             // create an accumulated color array that size of [block_size, COLOR_DIM]
@@ -300,7 +301,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                     // if alpha > 0.999, clamp the alpha to 0.999
                     S const alpha_clamp = min(0.999f, alpha_);
                     S potential_color = pix_out[k] + (alpha_clamp / (1 - alpha_clamp) * accumulated_color[t + 1][k] - cur_color) * Ts_batch[t];
-                    S potential_loss = fabs(potential_color - gt_image[pix_id * COLOR_DIM + k]) - cur_color_loss[k];
+                    S diff_ = potential_color - gt_image[pix_id * COLOR_DIM + k];
+                    diff_ = diff_ >= 0 ? diff_ : -diff_;
+                    S potential_loss = diff_ - cur_color_loss[k];
                     atomicAdd(&accumulated_potential_loss[g_], potential_loss);   
                 }
             }
@@ -383,14 +386,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         {C, image_height, image_width, 1}, -1, means2d.options().dtype(torch::kFloat32)
     );
 
-    torch::Tensor accumulated_potential_loss;
-
-    if (gt_image.has_value()) {
-        accumulated_potential_loss = torch::zeros({C, N}, means2d.options().dtype(torch::kFloat32));
-    }
-    else {
-        accumulated_potential_loss = torch::Tensor();
-    }
+    torch::Tensor accumulated_potential_loss = torch::zeros({C, N}, means2d.options().dtype(torch::kFloat32));
 
 
 
