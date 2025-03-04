@@ -68,7 +68,6 @@ def generate_commands():
         " --disable_viewer"
         " --strategy.blur_threshold 0.002"
         " --strategy.refine_start_iter 100"
-        " --strategy.refine_stop_iter 5000"
         f" --max_steps {1}"
         f" --eval_steps {1}"
         f" --save_steps {1}"
@@ -166,7 +165,7 @@ def generate_commands():
     grow_grad2ds = [0.0002]
     # start_sampling_ratio: float = 0.75
 
-    use_densifications = [False]   
+    use_densifications = [False, True]   
 
     distill_functions = ["l1", "l2"]
 
@@ -219,6 +218,7 @@ def generate_commands():
                                                 f" --distill_opacities_lambda {d_opacities}"
                                                 f" --image_lambda {image_lambda}"
                                                 f" --distill_loss_terms {distill_function}"
+                                                f" --strategy.refine_stop_iter {max_steps//4}"
                                                 )
                                         
 
