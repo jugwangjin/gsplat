@@ -69,6 +69,7 @@ def generate_commands():
                     for target in target_sampling_pairs:
                         start_sampling_ratio, target_sampling_ratio = target
                         for comb in combinations:
+                            d_alpha = comb["distill_alpha_lambda"]
                             d_sh = comb["distill_sh_lambda"]
                             d_colors = comb["distill_colors_lambda"]
                             d_depth = comb["distill_depth_lambda"]
@@ -102,6 +103,7 @@ def generate_commands():
                                         cmd += f" --start_sampling_ratio {start_sampling_ratio}"
                                         cmd += f" --target_sampling_ratio {target_sampling_ratio}"
                                         cmd += (f" --distill_sh_lambda {d_sh}"
+                                                f" --distill_alpha_lambda {d_alpha}"
                                                 f" --distill_colors_lambda {d_colors}"
                                                 f" --distill_depth_lambda {d_depth}"
                                                 f" --distill_xyzs_lambda {d_xyzs}"
@@ -124,7 +126,7 @@ def generate_commands():
                                             f"{DATASET_NAME}_{DATA_FACTOR}_FULL"
                                             f"_blur{use_blur_split}_novel{use_novel_view}_densify{use_densification}"
                                             f"_start{start_sampling_ratio}_target{target_sampling_ratio}"
-                                            f"_sh{d_sh}_colors{d_colors}_depth{d_depth}_xyzs{d_xyzs}_quats{d_quats}_scales{d_scales}_opacities{d_opacities}_image{image_lambda}_{distill_function}"
+                                            f"_alpha{d_alpha}_sh{d_sh}_colors{d_colors}_depth{d_depth}_xyzs{d_xyzs}_quats{d_quats}_scales{d_scales}_opacities{d_opacities}_image{image_lambda}_{distill_function}"
                                             f"_{key}"
                                         )
                                         output_dir_name += f"_grow2d{grow_grad2d}"
@@ -133,11 +135,6 @@ def generate_commands():
 
                                         if not os.path.exists(os.path.join(output_dir, 'ckpts', f'ckpt_{max_steps-1}_rank0.pt')):
                                             commands.append(cmd)
-
-
-
-
-
 
 
 
