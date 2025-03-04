@@ -40,7 +40,7 @@ def generate_commands():
 
     # Define lists of options.
     use_blur_splits = [True]
-    use_novel_views = [False]
+    use_novel_views = [False, True]
     # Target sampling is given as a pair (start, target). We format it as "start-target".
     target_sampling_pairs = [(0.8, 0.8)]
     
@@ -49,8 +49,6 @@ def generate_commands():
         {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0, "image_lambda": 1},
         {"distill_sh_lambda": 1, "distill_colors_lambda": 1, "distill_depth_lambda": 1, "distill_xyzs_lambda": 1, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0, "image_lambda": 1},
         {"distill_sh_lambda": 0, "distill_colors_lambda": 1, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0, "image_lambda": 1},
-        {"distill_sh_lambda": 1, "distill_colors_lambda": 1, "distill_depth_lambda": 1, "distill_xyzs_lambda": 1, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0, "image_lambda": 0},
-        {"distill_sh_lambda": 0, "distill_colors_lambda": 1, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0, "image_lambda": 0},
     ]
     key_for_gradients = ['means2d']
     # Even if there is only one value here, we include it to be explicit.
@@ -60,7 +58,7 @@ def generate_commands():
 
     use_densifications = [False, True]   
 
-    distill_functions = ["l1", "l2"]
+    distill_functions = ["l2"]
 
     # target_sampling_ratio: float = 0.9
     for distill_function in distill_functions:
