@@ -15,12 +15,12 @@ DATA_FACTOR = 4
 # Directories for teacher and student.
 FULL_TEACHER_CKPT = './gsplat_teachers/bicycle_4_ms/ckpts/ckpt_29999_rank0.pt'
 FULL_TEACHER_DIR = os.path.dirname(os.path.dirname(FULL_TEACHER_CKPT))
-STUDENT_DIR = os.path.join(result_dir_root, 'iterative_tests2')
+STUDENT_DIR = os.path.join(result_dir_root, 'rgb_loss_test')
 
 max_steps = 10000
 
 FULL_BASE_COMMAND = (
-    "python student_trainer_iterative.py distill2d"
+    "python student_trainer_prune_and_densify.py distill2d"
     f" --teacher_ckpt {FULL_TEACHER_CKPT}"
     f" --data_factor {DATA_FACTOR}"
     f" --data_dir {os.path.join(DATA_DIR, DATASET_NAME)}"
