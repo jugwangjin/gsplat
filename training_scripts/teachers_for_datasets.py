@@ -70,16 +70,16 @@ def generate_commands():
 
     # dense teachers
     for dataset_name in dataset_names:
-        command = f"python ms_d_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/{dataset_name} --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/teachers/{dataset_name}_4_dense --use_depth_reinit --disable_viewer"
+        command = f"python ms_d_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/{dataset_name} --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/teachers/{dataset_name}_4_dense --disable_viewer"
         if not os.path.exists(f'/Bean/log/gwangjin/2025/kdgs/teachers/{dataset_name}_4_dense/ckpts/ckpt_29999_rank0.pt'):
             commands.append(command)
         
     # small teachers
 
     for dataset_name in dataset_names:
-        command = f"python ms_trainer.py ms --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/{dataset_name} --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/teachers/{dataset_name}_4_small --use_depth_reinit --disable_viewer"
-        if not os.path.exists(f'/Bean/log/gwangjin/2025/kdgs/teachers/{dataset_name}_4_small/ckpts/ckpt_29999_rank0.pt'):
-            commands.append(command)
+        command = f"python ms_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/{dataset_name} --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/teachers/{dataset_name}_4_small --disable_viewer"
+        # if not os.path.exists(f'/Bean/log/gwangjin/2025/kdgs/teachers/{dataset_name}_4_small/ckpts/ckpt_29999_rank0.pt'):
+        commands.append(command)
 
     return commands
 
