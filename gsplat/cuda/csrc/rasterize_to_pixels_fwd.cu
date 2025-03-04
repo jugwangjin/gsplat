@@ -3,6 +3,9 @@
 #include <cooperative_groups.h>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
+#include <math_functions.h>
+
+#define MAX_RANGE 1024
 
 namespace gsplat {
 
@@ -135,10 +138,10 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     // designated pixel
     uint32_t tr = block.thread_rank();
 
-    uint32_t range = range_end - range_start;
-    S alpha_batch[range];     // declared here
-    int32_t g_batch[range];
-    S Ts_batch[range];
+    uint32_t const range = range_end - range_start;
+    S alpha_batch[MAX_RANGE];     // declared here
+    int32_t g_batch[MAX_RANGE];
+    S Ts_batch[MAX_RANGE];
     for (uint32_t t = 0; t < range; ++t) {
         alpha_batch[t] = 0.0f;
         g_batch[t] = -1;
@@ -264,11 +267,11 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             S cur_color_loss[COLOR_DIM];
             // calculate L1 loss (abs) for each channel between pix_out and gt_image
             for (uint32_t k = 0; k < COLOR_DIM; ++k) {
-                cur_color_loss[k] = abs(render_colors[pix_id * COLOR_DIM + k] - gt_image[pix_id * COLOR_DIM + k]);
+                cur_color_loss[k] = fabs(render_colors[pix_id * COLOR_DIM + k] - gt_image[pix_id * COLOR_DIM + k]);
             }
 
             // create an accumulated color array that size of [block_size, COLOR_DIM]
-            S accumulated_color[range+1][COLOR_DIM];
+            S accumulated_color[MAX_RANGE+1][COLOR_DIM];
             for (uint32_t t = 0; t < range+1; ++t) {
                 for (uint32_t k = 0; k < COLOR_DIM; ++k) {
                     accumulated_color[t][k] = 0.0f;
@@ -297,7 +300,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                     // if alpha > 0.999, clamp the alpha to 0.999
                     S const alpha_clamp = min(0.999f, alpha_);
                     S potential_color = pix_out[k] + (alpha_clamp / (1 - alpha_clamp) * accumulated_color[t + 1][k] - cur_color) * Ts_batch[t];
-                    S potential_loss = abs(potential_color - gt_image[pix_id * COLOR_DIM + k]) - cur_color_loss[k];
+                    S potential_loss = fabs(potential_color - gt_image[pix_id * COLOR_DIM + k]) - cur_color_loss[k];
                     atomicAdd(&accumulated_potential_loss[g_], potential_loss);   
                 }
             }
