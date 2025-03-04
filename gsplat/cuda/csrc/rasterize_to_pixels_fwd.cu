@@ -434,7 +434,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             tile_offsets.data_ptr<int32_t>(),
             flatten_ids.data_ptr<int32_t>(),
             
-            gt_image.data_ptr<float>(),
+            gt_image.has_value() ? gt_image.value().data_ptr<float>() : nullptr,
 
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
