@@ -148,7 +148,7 @@ class Config:
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
 
-    image_lambda: float = 1.0
+    image_lambda: float = 0
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -203,16 +203,15 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
 
-    distill_colors_lambda: float = 1e-1
-    distill_depth_lambda: float = 1e-1
-    distill_xyzs_lambda: float = 1e-1    
-    distill_quats_lambda: float = 1e-1    
-    distill_scales_lambda: float = 1e-1
-    distill_opacities_lambda: float = 1e-1
-    distill_sh_lambda: float = 1e-1
+    distill_colors_lambda: float = 1
+    distill_depth_lambda: float = 1
+    distill_xyzs_lambda: float = 1
+    distill_quats_lambda: float = 0
+    distill_scales_lambda: float = 0
+    distill_opacities_lambda: float = 0
+    distill_sh_lambda: float = 1
     
     distill_loss_terms: Literal["l1", "l2"] = "l1"
-    
 
 
     # Dump information to tensorboard every this steps
@@ -779,7 +778,7 @@ class Runner(TeacherRunner):
                     teacher_sh[-cfg.batch_size:] *= cfg.novel_view_weight
 
 
-
+    
             # loss
             l1loss = F.l1_loss(colors, pixels)
             ssimloss = 1.0 - fused_ssim(
@@ -813,8 +812,6 @@ class Runner(TeacherRunner):
 
                 shloss = distill_loss_function(sh.sum(dim=-1) / 3.0, teacher_sh.sum(dim=-1) / 3.0) * cfg.distill_sh_lambda
                 loss += shloss
-
-
 
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
