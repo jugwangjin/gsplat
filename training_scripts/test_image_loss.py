@@ -43,6 +43,7 @@ def generate_commands():
     use_novel_views = [False, True]
     # Target sampling is given as a pair (start, target). We format it as "start-target".
     target_sampling_pairs = [(0.8, 0.8),(0.6, 0.6)]
+    target_sampling_pairs = [(0.6, 0.6)]
     
     # Each combination is a dictionary of lambdas.
     combinations = [
