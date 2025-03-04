@@ -121,6 +121,7 @@ class Config:
 
     # Number of training steps
     max_steps: int = 10_000
+    kt_steps: int = 5_000
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [10_000])
     # Steps to save the model
@@ -204,18 +205,16 @@ class Config:
     # Weight for depth loss
 
     distill_alpha_lambda: float = 1
-    distill_colors_lambda: float = 1e-1
-    distill_depth_lambda: float = 1e-1
-    distill_xyzs_lambda: float = 1e-1    
-    distill_quats_lambda: float = 1e-1    
-    distill_scales_lambda: float = 1e-1
-    distill_opacities_lambda: float = 1e-1
-    distill_sh_lambda: float = 1e-1
+    distill_colors_lambda: float = 1
+    distill_depth_lambda: float = 1
+    distill_xyzs_lambda: float = 1
+    distill_quats_lambda: float = 0
+    distill_scales_lambda: float = 0
+    distill_opacities_lambda: float = 0
+    distill_sh_lambda: float = 1
     
-    distill_loss_terms: Literal["l1", "l2"] = "l1"
+    distill_loss_terms: Literal["l1", "l2"] = "l2"
     
-
-
     # Dump information to tensorboard every this steps
     tb_every: int = 100
     # Save training images to tensorboard
@@ -539,7 +538,6 @@ class Runner(TeacherRunner):
                 mode="training",
             )
 
-
         cfg.distill = cfg.distill_colors_lambda > 0.0 or \
                         cfg.distill_alpha_lambda > 0.0 or \
                         cfg.distill_depth_lambda > 0.0 or \
@@ -548,6 +546,7 @@ class Runner(TeacherRunner):
                         cfg.distill_scales_lambda > 0.0 or \
                         cfg.distill_opacities_lambda > 0.0 or \
                         cfg.distill_sh_lambda > 0.0 
+                        
                         # cfg.distill_sh0_lambda > 0.0 or \
                         # cfg.distill_shN_lambda > 0.0
 
@@ -644,45 +643,6 @@ class Runner(TeacherRunner):
 
             render_mode = "NS" if cfg.distill and cfg.distill_sh_lambda == 0 else "F" if cfg.distill else "RGB+ED+IW"
             
-
-            with torch.no_grad():
-                teacher_renders, _, _ = self.rasterize_splats(
-                    camtoworlds=camtoworlds,
-                    Ks=Ks,
-                    width=width,
-                    height=height,
-                    sh_degree=sh_degree_to_use,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane,
-                    image_ids=image_ids,
-                    render_mode=render_mode,
-                    masks=masks,
-                    splats = self.teacher_splats
-                )
-                teacher_rgb = teacher_renders[..., 0:3].detach().data # [1, H, W, 3]
-                teacher_xyzs = teacher_renders[..., 3:6].detach().data # [1, H, W, 3]
-                teacher_quats = teacher_renders[..., 6:10].detach().data # [1, H, W, 4]
-                teacher_scales = teacher_renders[..., 10:13].detach().data # [1, H, W, k*3]
-                teacher_opacities = teacher_renders[..., 13:14].detach().data # [1, H, W, 1]
-                teacher_sh = teacher_renders[..., 14:-1].detach().data # [1, H, W, k*3]
-                teacher_depths = teacher_renders[..., -1:].detach().data # [1, H, W, 1]
-
-                del teacher_renders
-    
-            if cfg.use_novel_view:
-
-                data_ = self.trainset.sample_novel_views(batch_size=cfg.batch_size)
-                Ks_ = data_["K"].to(device)  # [1, 3, 3]
-                camtoworlds_ = data_["camtoworld"].to(device)
-                image_ids_ = data_["image_id"].to(device)
-
-                with torch.no_grad():
-                    teacher_renders, _, _ = self.rasterize_splats(
-                        camtoworlds=camtoworlds_,
-                        Ks=Ks_,
-                        width=width,
-                        height=height,
-                        sh_degree=sh_degree_to_u
 
             with torch.no_grad():
                 teacher_renders, teacher_alphas, _ = self.rasterize_splats(
@@ -784,7 +744,6 @@ class Runner(TeacherRunner):
                 sh = renders[..., 14:-1]
 
 
-
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -827,18 +786,22 @@ class Runner(TeacherRunner):
 
 
 
-            # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
-            loss = (l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda) * cfg.image_lambda
+            if step > cfg.kt_steps:
+                # loss
+                l1loss = F.l1_loss(colors, pixels)
+                ssimloss = 1.0 - fused_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
+                loss = (l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda) * cfg.image_lambda
 
-            # loss = 0
-            distill_loss_function = F.l1_loss if cfg.distill_loss_terms == "l1" else F.mse_loss
-            if cfg.distill:
+            else:
+                loss = 0
+                # loss = 0
+                distill_loss_function = F.l1_loss if cfg.distill_loss_terms == "l1" else F.mse_loss
+
                 alpha_loss = distill_loss_function(alpha, teacher_alpha) * cfg.distill_alpha_lambda
                 loss += alpha_loss
+
                 colorloss = distill_loss_function(colors, teacher_rgb) * cfg.distill_colors_lambda
                 loss += colorloss
 
@@ -888,12 +851,12 @@ class Runner(TeacherRunner):
             loss.backward()
             
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| " if step > cfg.kt_steps else f"sh degree={sh_degree_to_use}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
-            if cfg.distill:
+            if cfg.distill and step <= cfg.kt_steps:
                 if cfg.distill_alpha_lambda > 0.0:
                     desc += f"alp={alpha_loss.item():.3f}| "
                 if cfg.distill_colors_lambda > 0.0:
