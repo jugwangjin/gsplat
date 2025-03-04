@@ -925,7 +925,6 @@ class _RasterizeToPixels(torch.autograd.Function):
         gt_image: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         
-        print(means2d.dtype, conics.dtype, colors.dtype, opacities.dtype, isect_offsets.dtype, flatten_ids.dtype)
         render_colors, render_alphas, last_ids, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths, accumulated_potential_loss = _make_lazy_cuda_func(
             "rasterize_to_pixels_fwd"
         )(
