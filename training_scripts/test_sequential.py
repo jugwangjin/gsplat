@@ -42,7 +42,7 @@ def generate_commands():
     use_blur_splits = [True]
     use_novel_views = [False]
     # Target sampling is given as a pair (start, target). We format it as "start-target".
-    target_sampling_pairs = [(0.7, 0.7)]
+    target_sampling_pairs = [(0.8, 0.8)]
     
     # Each combination is a dictionary of lambdas.
 
@@ -81,12 +81,15 @@ def generate_commands():
                                         if use_novel_view:
                                             cmd += " --use_novel_view"
                                         if not use_densification:
-                                            cmd += " --strategy.refine_stop_iter 0"
+                                            refine_stop_iter = 0
                                             start_sampling_ratio = target_sampling_ratio
+                                        else:
+                                            refine_stop_iter = max_steps // 4
+
                                         cmd += f" --start_sampling_ratio {start_sampling_ratio}"
                                         cmd += (f" --target_sampling_ratio {target_sampling_ratio}"
                                                 f" --distill_loss_terms {distill_function}"
-                                                f" --strategy.refine_stop_iter {max_steps//4}"
+                                                f" --strategy.refine_stop_iter {refine_stop_iter}"
                                                 f" --kt_steps {int(max_steps*kt)}"
                                                 )
                                         # Create an output directory name that embeds all options.
@@ -101,8 +104,8 @@ def generate_commands():
                                         output_dir = os.path.join(STUDENT_DIR, output_dir_name)
                                         cmd += f" --result_dir {output_dir}"
 
-                                        if not os.path.exists(os.path.join(output_dir, 'ckpts', f'ckpt_{max_steps-1}_rank0.pt')):
-                                            commands.append(cmd)
+                                        # if not os.path.exists(os.path.join(output_dir, 'ckpts', f'ckpt_{max_steps-1}_rank0.pt')):
+                                        commands.append(cmd)
 
 
 

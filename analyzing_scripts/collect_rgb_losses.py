@@ -4,7 +4,7 @@ import csv
 import json
 
 # Path to the training results directory (adjust if needed)
-STUDENT_DIR = './gsplat_students/rgb_loss_test2'
+STUDENT_DIR = './gsplat_students/rgb_loss_test3'
 # Name for the output CSV file
 OUTPUT_CSV = 'rgb_loss_analysis_results.csv'
 # Set MAX_STEPS as used in training (e.g. 10000)
