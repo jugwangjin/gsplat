@@ -25,7 +25,7 @@ FULL_BASE_COMMAND = (
     f" --data_factor {DATA_FACTOR}"
     f" --data_dir {os.path.join(DATA_DIR, DATASET_NAME)}"
     " --disable_viewer"
-    " --strategy.blur_threshold 0.002"
+    " --strategy.blur_threshold 0.005"
     " --strategy.refine_start_iter 100"
     " --strategy.refine_stop_iter 5000"
     f" --max_steps {max_steps}"
