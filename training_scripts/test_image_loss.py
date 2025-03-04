@@ -50,7 +50,6 @@ def generate_commands():
         {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0, "image_lambda": 1},
         {"distill_sh_lambda": 1, "distill_colors_lambda": 1, "distill_depth_lambda": 1, "distill_xyzs_lambda": 1, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0, "image_lambda": 1},
         {"distill_sh_lambda": 0, "distill_colors_lambda": 1, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0, "image_lambda": 1},
-        {"distill_sh_lambda": 0, "distill_colors_lambda": 0, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0, "image_lambda": 0},
         {"distill_sh_lambda": 1, "distill_colors_lambda": 1, "distill_depth_lambda": 1, "distill_xyzs_lambda": 1, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0, "image_lambda": 0},
         {"distill_sh_lambda": 0, "distill_colors_lambda": 1, "distill_depth_lambda": 0, "distill_xyzs_lambda": 0, "distill_quats_lambda": 0, "distill_scales_lambda": 0, "distill_opacities_lambda": 0, "image_lambda": 0},
     ]
