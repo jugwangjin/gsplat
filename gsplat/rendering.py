@@ -574,6 +574,7 @@ def rasterization(
                 backgrounds=backgrounds_chunk,
                 packed=packed,
                 absgrad=absgrad,
+                gt_image=gt_image[..., i * channel_chunk : (i + 1) * channel_chunk],
             )
             render_colors.append(render_colors_)
             # render_alphas.append(render_alphas_)
@@ -601,6 +602,7 @@ def rasterization(
             backgrounds=backgrounds,
             packed=packed,
             absgrad=absgrad,
+            gt_image=gt_image,  
         )
 
 

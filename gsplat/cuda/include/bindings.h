@@ -183,7 +183,7 @@ rasterize_to_pixels_fwd_tensor(
     const torch::Tensor &flatten_ids,   // [n_isects]
 
     // gt image
-    const torch::Tensor &gt_image // [C, image_height, image_width, D]
+    const at::optional<torch::Tensor> &gt_image // [C, image_height, image_width, D]
 );
 
 std::tuple<

@@ -326,7 +326,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor &flatten_ids,   // [n_isects]
 
     // GT image
-    const torch::Tensor &gt_image // [C, image_height, image_width, channels]
+    const at::optional<torch::Tensor> &gt_image // [C, image_height, image_width, channels]
 ) {
     GSPLAT_DEVICE_GUARD(means2d);
     GSPLAT_CHECK_INPUT(means2d);
@@ -467,7 +467,7 @@ rasterize_to_pixels_fwd_tensor(
     const torch::Tensor &flatten_ids,   // [n_isects]
 
     // GT image
-    const torch::Tensor &gt_image // [C, image_height, image_width, channels]
+    const at::optional<torch::Tensor> &gt_image // [C, image_height, image_width, channels]
 ) {
     GSPLAT_CHECK_INPUT(colors);
     uint32_t channels = colors.size(-1);
