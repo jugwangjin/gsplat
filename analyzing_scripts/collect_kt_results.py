@@ -5,7 +5,7 @@ import json
 import re
 
 # Path to the student results (change if needed)
-STUDENT_DIR = './gsplat_students/kt_test_on_ms2'
+STUDENT_DIR = './gsplat_students/kt_test_on_ms3'
 # Name for the output CSV file
 OUTPUT_CSV = 'analysis_results.csv'
 # Set MAX_STEPS as used in training (e.g. 10000)
