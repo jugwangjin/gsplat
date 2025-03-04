@@ -51,6 +51,7 @@ def rasterization(
     distributed: bool = False,
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
     covars: Optional[Tensor] = None,
+    gt_image: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -529,6 +530,8 @@ def rasterization(
     # print("rank", world_rank, "Before isect_offset_encode")
     isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
 
+    print(tiles_per_gauss.shape, isect_ids.shape, flatten_ids.shape, isect_offsets.shape)
+
     meta.update(
         {
             "tile_width": tile_width,
@@ -543,12 +546,14 @@ def rasterization(
             "n_cameras": C,
         }
     )
+
     # print("rank", world_rank, "Before rasterize_to_pixels")
     if colors.shape[-1] > channel_chunk:
         # slice into chunks
         n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
         render_colors, render_alphas = [], []
         max_ids, max_weights = [], []
+        accumulated_potential_loss = []
         for i in range(n_chunks):
             colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
             backgrounds_chunk = (
@@ -556,7 +561,7 @@ def rasterization(
                 if backgrounds is not None
                 else None
             )
-            render_colors_, render_alphas_, max_ids_, accumulated_weights_value_, accumulated_weights_count_, max_weight_depth_ = rasterize_to_pixels(
+            render_colors_, render_alphas_, max_ids_, accumulated_weights_value_, accumulated_weights_count_, max_weight_depth_, accumulated_potential_loss_ = rasterize_to_pixels(
                 means2d,
                 conics,
                 colors_chunk,
@@ -574,14 +579,16 @@ def rasterization(
             # render_alphas.append(render_alphas_)
             # max_ids.append(max_ids_)
             # max_weights.append(max_weights_)
+            accumulated_potential_loss.append(accumulated_potential_loss_)
         render_colors = torch.cat(render_colors, dim=-1)
         render_alphas = render_alphas_  # discard the rest
         max_ids = max_ids_ # discard the rest
         accumulated_weights_value = accumulated_weights_value_
         accumulated_weights_count = accumulated_weights_count_
         max_weight_depth = max_weight_depth_
+        accumulated_potential_loss = accumulated_potential_loss_.stack(dim=-1).sum(dim=-1)
     else:
-        render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depth = rasterize_to_pixels(
+        render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depth, accumulated_potential_loss = rasterize_to_pixels(
             means2d,
             conics,
             colors,
@@ -628,8 +635,8 @@ def rasterization(
                 "accumulated_weights_value": accumulated_weights_value,
                 "accumulated_weights_count": accumulated_weights_count,
                 "max_weight_depth": max_weight_depth,
+                "accumulated_potential_loss": accumulated_potential_loss,
             }
-
         )
 
     return render_colors, render_alphas, meta

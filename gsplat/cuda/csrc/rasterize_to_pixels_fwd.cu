@@ -31,13 +31,17 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     const uint32_t tile_height,
     const int32_t *__restrict__ tile_offsets, // [C, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
+
+    const S *__restrict__ gt_image, // [C, image_height, image_width, COLOR_DIM]
+
     S *__restrict__ render_colors, // [C, image_height, image_width, COLOR_DIM]
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids, // [C, image_height, image_width]
     int32_t *__restrict__ max_ids, // [C, image_height, image_width]
     S *__restrict__ accumulated_weights_value, // [C, N]
     int32_t *__restrict__ accumulated_weights_count, // [C, N]
-    S *__restrict__ max_weight_depths // [C, image_height, image_width, 1]
+    S *__restrict__ max_weight_depths, // [C, image_height, image_width, 1]
+    S *__restrict__ accumulated_potential_loss // [C, N]
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -60,6 +64,10 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     max_ids += camera_id * image_height * image_width;
     max_weight_depths += camera_id * image_height * image_width;
 
+    
+    if (gt_image != nullptr) {
+        gt_image += camera_id * image_height * image_width * COLOR_DIM;
+    }
 
     max_id = -1;
     max_weight = 0.0f;
@@ -127,6 +135,16 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     // designated pixel
     uint32_t tr = block.thread_rank();
 
+    uint32_t range = range_end - range_start;
+    S alpha_batch[range];     // declared here
+    int32_t g_batch[range];
+    S Ts_batch[range];
+    for (uint32_t t = 0; t < range; ++t) {
+        alpha_batch[t] = 0.0f;
+        g_batch[t] = -1;
+        Ts_batch[t] = 0.0f;
+    }
+
     S pix_out[COLOR_DIM] = {0.f};
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before beginning next batch
@@ -150,9 +168,16 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
         // wait for other threads to collect the gaussians in batch
         block.sync();
+        
 
         // process gaussians in the current batch for this pixel
         uint32_t batch_size = min(block_size, range_end - batch_start);
+
+
+        // create a temporary array to store vis (alpha * T) for each gaussian
+        // the size of array can be calculated by the for loop's condition
+        // but we use block_size for simplicity
+
         for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
             const vec3<S> conic = conic_batch[t];
             const vec3<S> xy_opac = xy_opacity_batch[t];
@@ -172,8 +197,11 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                 break;
             }
 
+
             int32_t g = id_batch[t];
             const S vis = alpha * T;
+            
+
             const S *c_ptr = colors + g * COLOR_DIM;
             GSPLAT_PRAGMA_UNROLL
             for (uint32_t k = 0; k < COLOR_DIM; ++k) {
@@ -193,6 +221,14 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
             cur_idx = batch_start + t;
 
+            if (gt_image != nullptr) {
+                int32_t local_cur_idx = batch_start - range_start + t;
+                // store the vis in the temporary array
+                alpha_batch[local_cur_idx] = alpha;
+                g_batch[local_cur_idx] = id_batch[t];
+                Ts_batch[local_cur_idx] = T;
+
+            }
             T = next_T;
         }
     }
@@ -203,6 +239,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
         // pass and it can be very small and causing large diff in gradients
         // with float32. However, double precision makes the backward pass 1.5x
         // slower so we stick with float for now.
+
+
         render_alphas[pix_id] = 1.0f - T;
         GSPLAT_PRAGMA_UNROLL
         for (uint32_t k = 0; k < COLOR_DIM; ++k) {
@@ -219,11 +257,56 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
         // depth of the gaussian with max visibility in this pixel
         max_weight_depths[pix_id] = max_depth;
+
+        if (gt_image != nullptr) {
+            // calculate the potential loss for each gaussian
+            // calculate the current color loss
+            S cur_color_loss[COLOR_DIM];
+            // calculate L1 loss (abs) for each channel between pix_out and gt_image
+            for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                cur_color_loss[k] = abs(render_colors[pix_id * COLOR_DIM + k] - gt_image[pix_id * COLOR_DIM + k]);
+            }
+
+            // create an accumulated color array that size of [block_size, COLOR_DIM]
+            S accumulated_color[range+1][COLOR_DIM];
+            for (uint32_t t = 0; t < range+1; ++t) {
+                for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                    accumulated_color[t][k] = 0.0f;
+                }
+            }
+
+
+            // iterate the accumulated color in backwards 
+            for (int32_t t = range - 1; t >= 0; --t) {
+                int32_t g_ = g_batch[t];
+                if (g_ == -1) {
+                    continue;
+                }
+                
+                // accumulate the color
+                // accumulation: current color * current alpha + (1-alpha) * accumulated color
+                const S alpha_ = alpha_batch[t];
+                const S *c_ptr_ = colors + g_ * COLOR_DIM;
+
+                GSPLAT_PRAGMA_UNROLL
+                for (uint32_t k = 0; k < COLOR_DIM; ++k) {
+                    S cur_color = c_ptr_[k] * alpha_;
+                    accumulated_color[t][k] = cur_color + (1 - alpha_) * accumulated_color[t + 1][k];
+                    
+                    // to calculate the potential loss, get the potential color if this gaussian is omitted: which is: color + alpha / (1 - alpha) * accumualted color of next index - cur_color
+                    // if alpha > 0.999, clamp the alpha to 0.999
+                    S const alpha_clamp = min(0.999f, alpha_);
+                    S potential_color = pix_out[k] + (alpha_clamp / (1 - alpha_clamp) * accumulated_color[t + 1][k] - cur_color) * Ts_batch[t];
+                    S potential_loss = abs(potential_color - gt_image[pix_id * COLOR_DIM + k]) - cur_color_loss[k];
+                    atomicAdd(&accumulated_potential_loss[g_], potential_loss);   
+                }
+            }
+        }
     }
 }
 
 template <uint32_t CDIM>
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,    // [C, N, 3] or [nnz, 3]
@@ -237,7 +320,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const uint32_t tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &flatten_ids,   // [n_isects]
+
+    // GT image
+    const torch::Tensor &gt_image // [C, image_height, image_width, channels]
 ) {
     GSPLAT_DEVICE_GUARD(means2d);
     GSPLAT_CHECK_INPUT(means2d);
@@ -294,6 +380,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         {C, image_height, image_width, 1}, -1, means2d.options().dtype(torch::kFloat32)
     );
 
+    torch::Tensor accumulated_potential_loss;
+
+    if (gt_image.defined()) {
+        accumulated_potential_loss = torch::zeros({C, N}, means2d.options().dtype(torch::kFloat32));
+    }
+    else {
+        accumulated_potential_loss = torch::Tensor();
+    }
+
+
+
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     const uint32_t shared_mem =
         tile_size * tile_size *
@@ -333,19 +430,23 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             tile_height,
             tile_offsets.data_ptr<int32_t>(),
             flatten_ids.data_ptr<int32_t>(),
+            
+            gt_image.data_ptr<float>(),
+
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
             max_ids.data_ptr<int32_t>(),
             accumulated_weights_value.data_ptr<float>(),
             accumulated_weights_count.data_ptr<int32_t>(),
-            max_weight_depths.data_ptr<float>()
+            max_weight_depths.data_ptr<float>(),
+            accumulated_potential_loss.data_ptr<float>()
         );
 
-    return std::make_tuple(renders, alphas, last_ids, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths);
+    return std::make_tuple(renders, alphas, last_ids, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths, accumulated_potential_loss);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_to_pixels_fwd_tensor(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
@@ -360,7 +461,10 @@ rasterize_to_pixels_fwd_tensor(
     const uint32_t tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &flatten_ids,   // [n_isects]
+
+    // GT image
+    const torch::Tensor &gt_image // [C, image_height, image_width, channels]
 ) {
     GSPLAT_CHECK_INPUT(colors);
     uint32_t channels = colors.size(-1);
@@ -378,7 +482,8 @@ rasterize_to_pixels_fwd_tensor(
             image_height,                                                      \
             tile_size,                                                         \
             tile_offsets,                                                      \
-            flatten_ids                                                        \
+            flatten_ids,                                                        \
+            gt_image                                                           \
         );
 
     // TODO: an optimization can be done by passing the actual number of

@@ -551,7 +551,7 @@ def rasterize_to_pixels(
         tile_width * tile_size >= image_width
     ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
 
-    render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths = _RasterizeToPixels.apply(
+    render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths, accumulated_potential_loss = _RasterizeToPixels.apply(
         means2d.contiguous(),
         conics.contiguous(),
         colors.contiguous(),
@@ -569,7 +569,7 @@ def rasterize_to_pixels(
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
 
-    return render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths
+    return render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths, accumulated_potential_loss
 
 
 @torch.no_grad()
@@ -919,9 +919,10 @@ class _RasterizeToPixels(torch.autograd.Function):
         tile_size: int,
         isect_offsets: Tensor,  # [C, tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
+        gt_images: Optional[Tensor],
         absgrad: bool,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        render_colors, render_alphas, last_ids, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths = _make_lazy_cuda_func(
+        render_colors, render_alphas, last_ids, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths, accumulated_potential_loss = _make_lazy_cuda_func(
             "rasterize_to_pixels_fwd"
         )(
             means2d,
@@ -935,6 +936,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             tile_size,
             isect_offsets,
             flatten_ids,
+            gt_images,
         )
 
         ctx.save_for_backward(
@@ -956,7 +958,7 @@ class _RasterizeToPixels(torch.autograd.Function):
 
         # double to float
         render_alphas = render_alphas.float()
-        return render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths
+        return render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths, accumulated_potential_loss
 
     @staticmethod
     def backward(
@@ -967,6 +969,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         v_accumulated_weights_value: Tensor,
         v_accumulated_weights_count,
         v_max_weight_depths,
+        accumulated_potential_loss,
     ):
         (
             means2d,

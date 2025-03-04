@@ -325,6 +325,110 @@ def simplification(
 
     return splats, optimizers
 
+
+
+
+@torch.no_grad()
+def simplification_from_mesh_simp(
+    trainset: Dataset, 
+    runner,
+    parser,
+    cfg,
+    sampling_factor: float = 0.1,
+    keep_sh0: bool = True,
+    keep_feats: bool = False,
+    batch_size: int = 1,
+    sparse_grad: bool = False,
+    visible_adam: bool = False,
+    world_size: int = 1,
+    init_scale: float = 1.0,
+    scene_scale: float = 1.0,
+    optimizers=None,
+    abs_ratio=False
+):
+    
+    trainloader = torch.utils.data.DataLoader(
+        trainset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=1,
+        persistent_workers=True,
+        pin_memory=True,
+    )
+
+    n_gaussian = runner.splats["means"].shape[0]
+
+    importance_scores = torch.zeros(n_gaussian, device=runner.splats["means"].device)
+    pixels_per_gaussian = torch.zeros(n_gaussian, device=runner.splats["means"].device, dtype=torch.int)
+
+    trainloader_iter = iter(trainloader)
+
+    accumulated_increased_losses = torch.zeros(n_gaussian, device=runner.splats["means"].device)
+    accumulated_weights_counts = torch.zeros(n_gaussian, device=runner.splats["means"].device)
+
+    for step in tqdm.tqdm(range(len(trainloader))):
+        data = next(trainloader_iter)
+
+        pixel = data["image"].to(runner.splats["means"].device) / 255.0
+        camtoworlds = camtoworlds_gt = data["camtoworld"].to(runner.splats["means"].device)
+        Ks = data["K"].to(runner.splats["means"].device)
+        image_ids = data["image_id"].to(runner.splats["means"].device)
+        masks = data["mask"].to(runner.splats["means"].device) if "mask" in data else None
+
+        width, height = pixel.shape[1:3]
+
+        # forward
+        _, _, info = runner.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=0,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+            image_ids=image_ids,
+            render_mode="RGB+IW",
+            masks=masks,
+            gt_image=pixel
+        )
+
+        increased_losses = info["accumulated_potential_loss"]
+
+        accumulated_increased_losses += increased_losses.sum(dim=0)
+
+        accumulated_weights_count = info["accumulated_weights_count"] # C N
+
+        accumulated_weights_counts += accumulated_weights_count.sum(dim=0)
+
+    # pick highest sampling_ratio % of the gaussians based on the accumulated_increased_losses
+    
+    # no prob, deterministic
+
+    indices = torch.argsort(accumulated_increased_losses, descending=True)[:int(n_gaussian * sampling_factor)]
+
+    splats, optimizers = create_splats_and_optimizers_from_data(
+        runner.splats["means"][indices],
+        sh0_to_rgb(runner.splats["sh0"][indices]),
+        runner=runner,
+        device=runner.splats["means"].device,
+        batch_size=batch_size,
+        sparse_grad=sparse_grad,
+        visible_adam=visible_adam,
+        world_size=world_size,
+        init_scale=init_scale,
+        scene_scale=scene_scale,
+        shN=runner.splats["shN"][indices] if keep_feats else None,
+        scales=runner.splats["scales"][indices] if keep_feats else None,
+        quats=runner.splats["quats"][indices] if keep_feats else None,
+        opacities=runner.splats["opacities"][indices] if keep_feats else None,
+        optimizers=optimizers,
+        keep_feats=keep_feats,
+        indices=indices,
+    )
+
+    return splats, optimizers
+
+
 @torch.no_grad()
 def depth_reinitialization(
         trainset: Dataset,
