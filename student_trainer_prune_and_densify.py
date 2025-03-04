@@ -644,46 +644,6 @@ class Runner(TeacherRunner):
 
             render_mode = "NS" if cfg.distill and cfg.distill_sh_lambda == 0 else "F" if cfg.distill else "RGB+ED+IW"
             
-
-            with torch.no_grad():
-                teacher_renders, _, _ = self.rasterize_splats(
-                    camtoworlds=camtoworlds,
-                    Ks=Ks,
-                    width=width,
-                    height=height,
-                    sh_degree=sh_degree_to_use,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane,
-                    image_ids=image_ids,
-                    render_mode=render_mode,
-                    masks=masks,
-                    splats = self.teacher_splats
-                )
-                teacher_rgb = teacher_renders[..., 0:3].detach().data # [1, H, W, 3]
-                teacher_xyzs = teacher_renders[..., 3:6].detach().data # [1, H, W, 3]
-                teacher_quats = teacher_renders[..., 6:10].detach().data # [1, H, W, 4]
-                teacher_scales = teacher_renders[..., 10:13].detach().data # [1, H, W, k*3]
-                teacher_opacities = teacher_renders[..., 13:14].detach().data # [1, H, W, 1]
-                teacher_sh = teacher_renders[..., 14:-1].detach().data # [1, H, W, k*3]
-                teacher_depths = teacher_renders[..., -1:].detach().data # [1, H, W, 1]
-
-                del teacher_renders
-    
-            if cfg.use_novel_view:
-
-                data_ = self.trainset.sample_novel_views(batch_size=cfg.batch_size)
-                Ks_ = data_["K"].to(device)  # [1, 3, 3]
-                camtoworlds_ = data_["camtoworld"].to(device)
-                image_ids_ = data_["image_id"].to(device)
-
-                with torch.no_grad():
-                    teacher_renders, _, _ = self.rasterize_splats(
-                        camtoworlds=camtoworlds_,
-                        Ks=Ks_,
-                        width=width,
-                        height=height,
-                        sh_degree=sh_degree_to_u
-
             with torch.no_grad():
                 teacher_renders, teacher_alphas, _ = self.rasterize_splats(
                     camtoworlds=camtoworlds,
@@ -782,7 +742,6 @@ class Runner(TeacherRunner):
                 scales = renders[..., 10:13]
                 opacities = renders[..., 13:14]
                 sh = renders[..., 14:-1]
-
 
 
             self.cfg.strategy.step_pre_backward(
