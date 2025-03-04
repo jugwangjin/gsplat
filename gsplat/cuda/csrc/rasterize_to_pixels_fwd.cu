@@ -385,7 +385,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
     torch::Tensor accumulated_potential_loss;
 
-    if (gt_image.defined()) {
+    if (gt_image.has_value()) {
         accumulated_potential_loss = torch::zeros({C, N}, means2d.options().dtype(torch::kFloat32));
     }
     else {
