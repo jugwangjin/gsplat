@@ -15,7 +15,7 @@ DATA_FACTOR = 4
 # Directories for teacher and student.
 FULL_TEACHER_CKPT = './gsplat_teachers/bicycle_4_ms/ckpts/ckpt_29999_rank0.pt'
 FULL_TEACHER_DIR = os.path.dirname(os.path.dirname(FULL_TEACHER_CKPT))
-STUDENT_DIR = os.path.join(result_dir_root, 'rgb_loss_test2')
+STUDENT_DIR = os.path.join(result_dir_root, 'rgb_loss_test3')
 
 max_steps = 10000
 
@@ -27,7 +27,6 @@ FULL_BASE_COMMAND = (
     " --disable_viewer"
     " --strategy.blur_threshold 0.005"
     " --strategy.refine_start_iter 100"
-    " --strategy.refine_stop_iter 5000"
     f" --max_steps {max_steps}"
     f" --eval_steps {max_steps}"
     f" --save_steps {max_steps}"
