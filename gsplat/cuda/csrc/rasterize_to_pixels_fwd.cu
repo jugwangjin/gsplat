@@ -5,7 +5,7 @@
 #include <cuda_runtime.h>
 #include <math_functions.h>
 
-#define MAX_RANGE 4096
+#define MAX_RANGE 512
 
 namespace gsplat {
 
@@ -358,7 +358,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     dim3 threads = {tile_size, tile_size, 1};
     dim3 blocks = {C, tile_height, tile_width};
 
-    torch::Tensor renders = torch::empty(
+    torch::Tensor renders = torch::zeros(
         {C, image_height, image_width, channels},
         means2d.options().dtype(torch::kFloat32)
     );

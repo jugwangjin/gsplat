@@ -1,0 +1,2 @@
+CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=3 python ms_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/simp_comp/ms 
+CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=2 python ms_trainer_mesh_simp.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/simp_comp/simp 

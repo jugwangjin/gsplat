@@ -525,6 +525,7 @@ def depth_reinitialization(
         out_pts_list.append(world_coords[indices])
         gt_list.append(gt[indices])
     
+
     out_pts_merged = torch.cat(out_pts_list, dim=0)
     gt_merged = torch.cat(gt_list, dim=0)
 

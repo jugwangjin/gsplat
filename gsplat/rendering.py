@@ -491,7 +491,7 @@ def rasterization(
         xyzs = means.unsqueeze(0).repeat(C, 1, 1) # shape of N, 3
         quats = quats.unsqueeze(0).repeat(C, 1, 1) # shape of N, 4
         scales = scales.unsqueeze(0).repeat(C, 1, 1)
-        colors = torch.cat((rgbs, xyzs, quats, scales, opacities[..., None], sh_coeffs), dim=-1)
+        colors = torch.cat((rgbs, xyzs, quats, scales, opacities[..., None], depths[..., None]), dim=-1)
 
     elif render_mode in ["RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW"]:
         colors = torch.cat((colors, depths[..., None]), dim=-1)
@@ -587,6 +587,7 @@ def rasterization(
         max_weight_depth = max_weight_depth_
         accumulated_potential_loss = accumulated_potential_loss_.stack(dim=-1).sum(dim=-1)
     else:
+
         render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depth, accumulated_potential_loss = rasterize_to_pixels(
             means2d,
             conics,
@@ -602,7 +603,6 @@ def rasterization(
             absgrad=absgrad,
             gt_image=gt_image if gt_image is not None else None,  
         )
-
 
     if render_mode in ["ED", "RGB+ED", "RGB+ED+IW", "F", "NS"]:
         # normalize the accumulated depth to get the expected depth

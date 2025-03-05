@@ -567,7 +567,7 @@ def rasterize_to_pixels(
         absgrad,
         gt_image,
     )
-
+    
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
 
@@ -941,7 +941,6 @@ class _RasterizeToPixels(torch.autograd.Function):
             flatten_ids,
             gt_image,
         )
-
         ctx.save_for_backward(
             means2d,
             conics,

@@ -625,7 +625,6 @@ class Runner:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
-
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
                     (torch.arange(height, device=self.device) + 0.5) / height,
@@ -646,12 +645,12 @@ class Runner:
                 step=step,
                 info=info,
             )
-
-            # loss
+                # loss
             l1loss = F.l1_loss(colors, pixels)
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
+
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
                 # query depths from depth map
@@ -1028,7 +1027,6 @@ class Runner:
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
-            torch.cuda.synchronize()
             tic = time.time()
 
             render_mode = 'RGB'
@@ -1046,7 +1044,6 @@ class Runner:
                 masks=masks,
                 render_mode=render_mode,
             )  # [1, H, W, 3]
-            torch.cuda.synchronize()
             ellipse_time += time.time() - tic
 
             colors = torch.clamp(colors, 0.0, 1.0)[..., :3]
