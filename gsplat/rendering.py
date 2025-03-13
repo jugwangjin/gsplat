@@ -545,6 +545,9 @@ def rasterization(
         }
     )
 
+    if gt_image is not None:
+        assert gt_image.shape[-1] == 3, gt_image.shape
+
     # print("rank", world_rank, "Before rasterize_to_pixels")
     if colors.shape[-1] > channel_chunk:
         # slice into chunks
@@ -552,6 +555,8 @@ def rasterization(
         render_colors, render_alphas = [], []
         max_ids, max_weights = [], []
         accumulated_potential_loss = []
+        
+
         for i in range(n_chunks):
             colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
             backgrounds_chunk = (
@@ -587,7 +592,6 @@ def rasterization(
         max_weight_depth = max_weight_depth_
         accumulated_potential_loss = accumulated_potential_loss_.stack(dim=-1).sum(dim=-1)
     else:
-
         render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depth, accumulated_potential_loss = rasterize_to_pixels(
             means2d,
             conics,

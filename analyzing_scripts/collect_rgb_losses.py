@@ -25,6 +25,7 @@ def parse_directory_name(dir_name):
     
     If the naming does not match this pattern (or a simple 'zero' format), the raw directory name is saved.
     """
+    # inlcuding alphas
     parts = dir_name.split('_')
     config = {}
     try:

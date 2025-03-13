@@ -258,6 +258,39 @@ def remove(
             state[k] = v[sel]
 
 
+
+@torch.no_grad()
+def remove_return(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+):
+    """Inplace remove the Gaussian with the given mask.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        mask: A boolean mask to remove the Gaussians.
+    """
+    sel = torch.where(~mask)[0]
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        return torch.nn.Parameter(p[sel], requires_grad=p.requires_grad)
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        return v[sel]
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    # update the extra running state
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            state[k] = v[sel]
+
+    return params, optimizers
+
+
 @torch.no_grad()
 def reset_opa(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],

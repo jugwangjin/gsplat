@@ -3,9 +3,6 @@
 #include <cooperative_groups.h>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
-#include <math_functions.h>
-
-#define MAX_RANGE 512
 
 namespace gsplat {
 
@@ -69,7 +66,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
     
     if (gt_image != nullptr) {
-        gt_image += camera_id * image_height * image_width * COLOR_DIM;
+        gt_image += camera_id * image_height * image_width * 3;
     }
 
     max_id = -1;
@@ -130,6 +127,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     // numerical precision so we use double for it. However double make bwd 1.5x
     // slower so we stick with float for now.
     S T = 1.0f;
+    S T_ = 1.0f;
     // index of most recent gaussian to write to this thread's pixel
     uint32_t cur_idx = 0;
 
@@ -138,17 +136,10 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     // designated pixel
     uint32_t tr = block.thread_rank();
 
-    uint32_t const range = range_end - range_start;
-    S alpha_batch[MAX_RANGE];     // declared here
-    int32_t g_batch[MAX_RANGE];
-    S Ts_batch[MAX_RANGE];
-    for (uint32_t t = 0; t < range; ++t) {
-        alpha_batch[t] = 0.0f;
-        g_batch[t] = -1;
-        Ts_batch[t] = 0.0f;
-    }
-
     S pix_out[COLOR_DIM] = {0.f};
+    S pix_out_[COLOR_DIM] = {0.f};
+
+
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before beginning next batch
         // end early if entire tile is done
@@ -224,17 +215,121 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
             cur_idx = batch_start + t;
 
-            if (gt_image != nullptr) {
-                int32_t local_cur_idx = batch_start - range_start + t;
-                // store the vis in the temporary array
-                alpha_batch[local_cur_idx] = alpha;
-                g_batch[local_cur_idx] = id_batch[t];
-                Ts_batch[local_cur_idx] = T;
+            // if (gt_image != nullptr) {
+            //     int32_t local_cur_idx = batch_start - range_start + t;
+            //     // store the vis in the temporary array
+            //     alpha_batch[local_cur_idx] = alpha;
+            //     g_batch[local_cur_idx] = id_batch[t];
+            //     Ts_batch[local_cur_idx] = T;
 
-            }
+            // }
             T = next_T;
         }
     }
+
+
+    if (gt_image != nullptr){
+        // Only cover 3D (RGB) gt_image, no matter how many dimensions the rendered images or gt_image have. 
+        
+        // Accumulate again, computing the potential error when we omit each gaussian
+
+        S cur_color_loss[3] = {0.0f};
+        // calculate L1 loss (abs) for each channel between pix_out and gt_image
+        for (uint32_t k = 0; k < 3; ++k) {
+            S diff = pix_out[k] - gt_image[pix_id * 3 + k];
+            cur_color_loss[k] = diff >= 0 ? diff : -diff;
+        }
+
+        S cur_color[COLOR_DIM] = {0.0f};
+        S remaining_color[COLOR_DIM] = {0.0f};
+        S expected_color[COLOR_DIM] = {0.0f};
+        S potential_loss[3] = {0.0f};
+        S expected_loss_inc;
+        
+        for (uint32_t b = 0; b < num_batches; ++b) {
+            // resync all threads before beginning next batch
+            // end early if entire tile is done
+            if (__syncthreads_count(done) >= block_size) {
+                break;
+            }
+
+            // each thread fetch 1 gaussian from front to back
+            // index of gaussian to load
+            uint32_t batch_start = range_start + block_size * b;
+            uint32_t idx = batch_start + tr;
+            if (idx < range_end) {
+                int32_t g = flatten_ids[idx]; // flatten index in [C * N] or [nnz]
+                id_batch[tr] = g;
+                const vec2<S> xy = means2d[g];
+                const S opac = opacities[g];
+                xy_opacity_batch[tr] = {xy.x, xy.y, opac};
+                conic_batch[tr] = conics[g];
+            }
+
+            // wait for other threads to collect the gaussians in batch
+            block.sync();
+            
+
+            // process gaussians in the current batch for this pixel
+            uint32_t batch_size = min(block_size, range_end - batch_start);
+
+
+            // create a temporary array to store vis (alpha * T) for each gaussian
+            // the size of array can be calculated by the for loop's condition
+            // but we use block_size for simplicity
+
+            for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
+                const vec3<S> conic = conic_batch[t];
+                const vec3<S> xy_opac = xy_opacity_batch[t];
+                const S opac = xy_opac.z;
+                const vec2<S> delta = {xy_opac.x - px, xy_opac.y - py};
+                const S sigma = 0.5f * (conic.x * delta.x * delta.x +
+                                        conic.z * delta.y * delta.y) +
+                                conic.y * delta.x * delta.y;
+                S alpha = min(0.999f, opac * __expf(-sigma));
+                if (sigma < 0.f || alpha < 1.f / 255.f) {
+                    continue;
+                }
+
+                const S next_T = T_ * (1.0f - alpha);
+                if (next_T <= 1e-4) { // this pixel is done: exclusive
+                    done = true;
+                    break;
+                }
+
+                int32_t g = id_batch[t];
+                const S vis = alpha * T_;
+                
+                const S *c_ptr = colors + g * COLOR_DIM;
+                GSPLAT_PRAGMA_UNROLL
+                for (uint32_t k = 0; k < 3; ++k) {
+                    cur_color[k] = c_ptr[k] * vis;
+                    remaining_color[k] = pix_out[k] - cur_color[k] - pix_out_[k];
+                    expected_color[k] = pix_out_[k] + remaining_color[k] / (1-alpha);
+                    pix_out_[k] += cur_color[k];
+
+                    potential_loss[k] = expected_color[k] - gt_image[pix_id * 3 + k];
+                    potential_loss[k] = potential_loss[k] >= 0 ? potential_loss[k] : -potential_loss[k];
+                    // expected_loss_inc = potential_loss[k] - cur_color_loss[k];
+                    atomicAdd(&accumulated_potential_loss[g], potential_loss[k]);
+                    
+                }
+                
+                // final rendered rgb image : pix_out
+                // the effect of current gaussian's color: c_ptr * vis
+                // the effect of remaining gaussians: pix_out - c_ptr * vis - pix_out_
+                // when we omit this gaussian, the remaining gaussian's colors will T/next_T
+
+                T_ = next_T;
+            }
+        }
+    }
+
+
+
+
+
+
 
     if (inside) {
         // Here T is the transmittance AFTER the last gaussian in this pixel.
@@ -261,53 +356,6 @@ __global__ void rasterize_to_pixels_fwd_kernel(
         // depth of the gaussian with max visibility in this pixel
         max_weight_depths[pix_id] = max_depth;
 
-        if (gt_image != nullptr) {
-            // calculate the potential loss for each gaussian
-            // calculate the current color loss
-            S cur_color_loss[COLOR_DIM];
-            // calculate L1 loss (abs) for each channel between pix_out and gt_image
-            for (uint32_t k = 0; k < COLOR_DIM; ++k) {
-                S diff = render_colors[pix_id * COLOR_DIM + k] - gt_image[pix_id * COLOR_DIM + k];
-                cur_color_loss[k] += diff >= 0 ? diff : -diff;
-            }
-
-            // create an accumulated color array that size of [block_size, COLOR_DIM]
-            S accumulated_color[MAX_RANGE+1][COLOR_DIM];
-            for (uint32_t t = 0; t < range+1; ++t) {
-                for (uint32_t k = 0; k < COLOR_DIM; ++k) {
-                    accumulated_color[t][k] = 0.0f;
-                }
-            }
-
-
-            // iterate the accumulated color in backwards 
-            for (int32_t t = range - 1; t >= 0; --t) {
-                int32_t g_ = g_batch[t];
-                if (g_ == -1) {
-                    continue;
-                }
-                
-                // accumulate the color
-                // accumulation: current color * current alpha + (1-alpha) * accumulated color
-                const S alpha_ = alpha_batch[t];
-                const S *c_ptr_ = colors + g_ * COLOR_DIM;
-
-                GSPLAT_PRAGMA_UNROLL
-                for (uint32_t k = 0; k < COLOR_DIM; ++k) {
-                    S cur_color = c_ptr_[k] * alpha_;
-                    accumulated_color[t][k] = cur_color + (1 - alpha_) * accumulated_color[t + 1][k];
-                    
-                    // to calculate the potential loss, get the potential color if this gaussian is omitted: which is: color + alpha / (1 - alpha) * accumualted color of next index - cur_color
-                    // if alpha > 0.999, clamp the alpha to 0.999
-                    S const alpha_clamp = min(0.999f, alpha_);
-                    S potential_color = pix_out[k] + (alpha_clamp / (1 - alpha_clamp) * accumulated_color[t + 1][k] - cur_color) * Ts_batch[t];
-                    S diff_ = potential_color - gt_image[pix_id * COLOR_DIM + k];
-                    diff_ = diff_ >= 0 ? diff_ : -diff_;
-                    S potential_loss = diff_ - cur_color_loss[k];
-                    atomicAdd(&accumulated_potential_loss[g_], potential_loss);   
-                }
-            }
-        }
     }
 }
 

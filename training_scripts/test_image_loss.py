@@ -59,7 +59,7 @@ def generate_commands():
 
     use_densifications = [False, True]   
 
-    distill_functions = ["l2"]
+    distill_functions = ["l2", "l1"]
 
     # target_sampling_ratio: float = 0.9
     for distill_function in distill_functions:
@@ -135,6 +135,7 @@ def generate_commands():
 
                                         if not os.path.exists(os.path.join(output_dir, 'ckpts', f'ckpt_{max_steps-1}_rank0.pt')):
                                             commands.append(cmd)
+
 
 
 

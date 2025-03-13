@@ -13,7 +13,7 @@ from gsplat.utils import save_ply, depth_to_points
 from torch.utils.data import Dataset
 from gsplat.optimizers import SelectiveAdam
 
-from gsplat.strategy.ops import duplicate, remove, reset_opa, split
+from gsplat.strategy.ops import duplicate, remove, reset_opa, split, remove_return
 
 
 
@@ -303,25 +303,34 @@ def simplification(
 
     # else
 
-    splats, optimizers = create_splats_and_optimizers_from_data(
-        runner.splats["means"][indices],
-        sh0_to_rgb(runner.splats["sh0"][indices]),
-        runner=runner,
-        device=runner.splats["means"].device,
-        batch_size=batch_size,
-        sparse_grad=sparse_grad,
-        visible_adam=visible_adam,
-        world_size=world_size,
-        init_scale=init_scale,
-        scene_scale=scene_scale,
-        shN=runner.splats["shN"][indices] if keep_feats else None,
-        scales=runner.splats["scales"][indices] if keep_feats else None,
-        quats=runner.splats["quats"][indices] if keep_feats else None,
-        opacities=runner.splats["opacities"][indices] if keep_feats else None,
-        optimizers=optimizers,
-        keep_feats=keep_feats,
-        indices=indices,
-    )
+    if keep_feats:
+        # invert indices
+        mask = torch.zeros(n_gaussian, device=runner.splats["means"].device)
+        mask[indices] = 1
+        mask = 1 - mask
+        mask = mask.bool()
+        splats, optimizers = remove_return(runner.splats, runner.optimizers, runner.strategy_state, mask)
+
+    else:
+        splats, optimizers = create_splats_and_optimizers_from_data(
+            runner.splats["means"][indices],
+            sh0_to_rgb(runner.splats["sh0"][indices]),
+            runner=runner,
+            device=runner.splats["means"].device,
+            batch_size=batch_size,
+            sparse_grad=sparse_grad,
+            visible_adam=visible_adam,
+            world_size=world_size,
+            init_scale=init_scale,
+            scene_scale=scene_scale,
+            shN=runner.splats["shN"][indices] if keep_feats else None,
+            scales=runner.splats["scales"][indices] if keep_feats else None,
+            quats=runner.splats["quats"][indices] if keep_feats else None,
+            opacities=runner.splats["opacities"][indices] if keep_feats else None,
+            optimizers=optimizers,
+            keep_feats=keep_feats,
+            indices=indices,
+        )
 
     return splats, optimizers
 
@@ -344,7 +353,9 @@ def simplification_from_mesh_simp(
     init_scale: float = 1.0,
     scene_scale: float = 1.0,
     optimizers=None,
-    abs_ratio=False
+    abs_ratio=False,
+    ascending=False,
+    disable_mean = False,
 ):
     
     trainloader = torch.utils.data.DataLoader(
@@ -366,7 +377,7 @@ def simplification_from_mesh_simp(
     accumulated_increased_losses = torch.zeros(n_gaussian, device=runner.splats["means"].device)
     accumulated_weights_counts = torch.zeros(n_gaussian, device=runner.splats["means"].device)
 
-    for step in tqdm.tqdm(range(len(trainloader))):
+    for _ in tqdm.tqdm(range(len(trainloader))):
         data = next(trainloader_iter)
 
         pixel = data["image"].to(runner.splats["means"].device) / 255.0
@@ -393,40 +404,253 @@ def simplification_from_mesh_simp(
         )
 
         increased_losses = info["accumulated_potential_loss"]
+        accumulated_weights_count = info["accumulated_weights_count"]
 
-        accumulated_increased_losses += increased_losses.sum(dim=0)
-
-        accumulated_weights_count = info["accumulated_weights_count"] # C N
-
+        accumulated_increased_losses += (increased_losses.sum(dim=0) / (width * height))
         accumulated_weights_counts += accumulated_weights_count.sum(dim=0)
 
-    # pick highest sampling_ratio % of the gaussians based on the accumulated_increased_losses
+        if torch.isnan(increased_losses).any():
+            exit()
+
+    if not disable_mean:
+        accumulated_increased_losses /= accumulated_weights_counts.clamp(min=1)
+
+    # indices to keep
+    indices = torch.argsort(accumulated_increased_losses, descending=False if ascending else True)[:int(n_gaussian * sampling_factor)]
     
-    # no prob, deterministic
 
-    indices = torch.argsort(accumulated_increased_losses, descending=True)[:int(n_gaussian * sampling_factor)]
+    # indices_ = torch.argsort(accumulated_increased_losses, descending=False)[:int(n_gaussian * sampling_factor)]
+    # print("descending", torch.sigmoid(runner.splats["opacities"][indices_]).min(), torch.sigmoid(runner.splats["opacities"][indices_]).max(),\
+    #     torch.sigmoid(runner.splats["opacities"][indices_]).mean(), torch.sigmoid(runner.splats["opacities"][indices_]).std())
+    # indices_ = torch.argsort(accumulated_increased_losses, descending=True)[:int(n_gaussian * sampling_factor)]
+    # print("ascending", torch.sigmoid(runner.splats["opacities"][indices_]).min(), torch.sigmoid(runner.splats["opacities"][indices_]).max(),\
+    #     torch.sigmoid(runner.splats["opacities"][indices_]).mean(), torch.sigmoid(runner.splats["opacities"][indices_]).std())
 
-    splats, optimizers = create_splats_and_optimizers_from_data(
-        runner.splats["means"][indices],
-        sh0_to_rgb(runner.splats["sh0"][indices]),
-        runner=runner,
-        device=runner.splats["means"].device,
-        batch_size=batch_size,
-        sparse_grad=sparse_grad,
-        visible_adam=visible_adam,
-        world_size=world_size,
-        init_scale=init_scale,
-        scene_scale=scene_scale,
-        shN=runner.splats["shN"][indices] if keep_feats else None,
-        scales=runner.splats["scales"][indices] if keep_feats else None,
-        quats=runner.splats["quats"][indices] if keep_feats else None,
-        opacities=runner.splats["opacities"][indices] if keep_feats else None,
-        optimizers=optimizers,
-        keep_feats=keep_feats,
-        indices=indices,
-    )
+    if keep_feats:
+        # simply prune the gaussians
+        # pruning mask has value True where we want to prune
+        pruning_mask = torch.zeros(n_gaussian, device=runner.splats["means"].device)
+        pruning_mask[indices] = 1
+        pruning_mask = 1 - pruning_mask
+        
+        pruning_mask = pruning_mask.bool()
+
+        splats, optimizers = remove_return(runner.splats, optimizers, runner.strategy_state, pruning_mask)
+    else:
+        splats, optimizers = create_splats_and_optimizers_from_data(
+            runner.splats["means"][indices],
+            sh0_to_rgb(runner.splats["sh0"][indices]),
+            runner=runner,
+            device=runner.splats["means"].device,
+            batch_size=batch_size,
+            sparse_grad=sparse_grad,
+            visible_adam=visible_adam,
+            world_size=world_size,
+            init_scale=init_scale,
+            scene_scale=scene_scale,
+            shN=runner.splats["shN"][indices] if keep_feats else None,
+            scales=runner.splats["scales"][indices] if keep_feats else None,
+            quats=runner.splats["quats"][indices] if keep_feats else None,
+            opacities=runner.splats["opacities"][indices] if keep_feats else None,
+            optimizers=optimizers,
+            keep_feats=keep_feats,
+            indices=indices,
+        )
 
     return splats, optimizers
+
+@torch.no_grad()
+def compare_simplifications(
+    trainset: Dataset, 
+    runner,
+    parser,
+    cfg,
+    sampling_factor: float = 0.1,
+    cdf_threshold: float = 0.99,
+    use_cdf_mask: bool = False,
+    keep_sh0: bool = True,
+    keep_feats: bool = False,
+    batch_size: int = 1,
+    sparse_grad: bool = False,
+    visible_adam: bool = False,
+    world_size: int = 1,
+    init_scale: float = 1.0,
+    scene_scale: float = 1.0,
+    optimizers=None,
+    abs_ratio=False
+):
+    # Get data from first method (simplification)
+    trainloader = torch.utils.data.DataLoader(
+        trainset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=1,
+        persistent_workers=True,
+        pin_memory=True,
+    )
+
+    n_gaussian = runner.splats["means"].shape[0]
+    device = runner.splats["means"].device
+
+    # Calculate importance scores for simplification method
+    importance_scores = torch.zeros(n_gaussian, device=device)
+    pixels_per_gaussian = torch.zeros(n_gaussian, device=device, dtype=torch.int)
+
+    trainloader_iter = iter(trainloader)
+
+    print("Calculating importance scores for simplification method...")
+    for step in tqdm.tqdm(range(len(trainloader))):
+        data = next(trainloader_iter)
+
+        pixel = data["image"].to(device) / 255.0
+        camtoworlds = data["camtoworld"].to(device)
+        Ks = data["K"].to(device)
+        image_ids = data["image_id"].to(device)
+        masks = data["mask"].to(device) if "mask" in data else None
+
+        width, height = pixel.shape[1:3]
+
+        # forward
+        _, _, info = runner.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=0,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+            image_ids=image_ids,
+            render_mode="RGB+IW",
+            masks=masks,
+        )
+
+        max_ids = info["max_ids"]
+        max_ids_valid_mask = max_ids >= 0
+        max_ids = max_ids % n_gaussian
+
+        batch_pixels_per_gaussian = torch.zeros_like(pixels_per_gaussian)
+        batch_pixels_per_gaussian.index_add_(
+            0, max_ids[max_ids_valid_mask].flatten(), torch.ones_like(max_ids[max_ids_valid_mask]).flatten()
+        )
+
+        pixels_per_gaussian += batch_pixels_per_gaussian
+
+        accumulated_weights_value = info["accumulated_weights_value"]
+        accumulated_weights_count = info["accumulated_weights_count"]
+
+        for i in range(accumulated_weights_value.shape[0]):
+            importance_score = accumulated_weights_value[i] / (accumulated_weights_count[i].clamp(min=1))
+            accumulated_weights_valid_mask = batch_pixels_per_gaussian > 0
+            importance_scores[accumulated_weights_valid_mask] += importance_score[accumulated_weights_valid_mask]
+ 
+    importance_scores[pixels_per_gaussian == 0] = 0
+    
+    # Calculate probability for simplification method
+    prob_simplification = importance_scores / importance_scores.sum()
+    
+    # Reset trainloader for second method
+    trainloader = torch.utils.data.DataLoader(
+        trainset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=1,
+        persistent_workers=True,
+        pin_memory=True,
+    )
+    trainloader_iter = iter(trainloader)
+    
+    # Calculate accumulated increased losses for simplification_from_mesh_simp method
+    accumulated_increased_losses = torch.zeros(n_gaussian, device=device)
+    accumulated_weights_counts = torch.zeros(n_gaussian, device=device)
+
+    print("Calculating accumulated increased losses for simplification_from_mesh_simp method...")
+    for _ in tqdm.tqdm(range(len(trainloader))):
+        data = next(trainloader_iter)
+
+        pixel = data["image"].to(device) / 255.0
+        camtoworlds = data["camtoworld"].to(device)
+        Ks = data["K"].to(device)
+        image_ids = data["image_id"].to(device)
+        masks = data["mask"].to(device) if "mask" in data else None
+
+        width, height = pixel.shape[1:3]
+
+        # forward
+        _, _, info = runner.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=0,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+            image_ids=image_ids,
+            render_mode="RGB+IW",
+            masks=masks,
+            gt_image=pixel
+        )
+
+        increased_losses = info["accumulated_potential_loss"]
+        accumulated_weights_count = info["accumulated_weights_count"]
+
+        accumulated_increased_losses += (increased_losses.sum(dim=0) / (width * height))
+        accumulated_weights_counts += accumulated_weights_count.sum(dim=0)
+
+    # Mean of accumulated increased losses
+    # accumulated_increased_losses /= accumulated_weights_counts.clamp(min=1)
+    
+    # For simplification_from_mesh_simp, we use inverse of accumulated_increased_losses
+    # since lower loss means higher importance
+    inverse_losses = 1.0 / (accumulated_increased_losses + 1e-10)  # Add small epsilon to avoid division by zero
+    
+    # Calculate probability for simplification_from_mesh_simp method
+    prob_mesh_simp = inverse_losses / inverse_losses.sum()
+    
+    # before plotting, normalize both to have range of [0, 1]
+    prob_simplification = prob_simplification / torch.amax(prob_simplification)
+    prob_mesh_simp = prob_mesh_simp / torch.amax(prob_mesh_simp)
+
+    # Convert to numpy for plotting
+    prob_simplification_np = prob_simplification.cpu().numpy()
+    prob_mesh_simp_np = prob_mesh_simp.cpu().numpy()
+    
+    # Plot the correlation
+    import matplotlib.pyplot as plt
+    
+    plt.figure(figsize=(10, 8))
+    plt.scatter(prob_simplification_np, prob_mesh_simp_np, alpha=0.5, s=1)
+    plt.xlabel('Probability from simplification')
+    plt.ylabel('Probability from simplification_from_mesh_simp (inverse loss)')
+    plt.title('Correlation between simplification methods')
+    plt.xlim(0, max(prob_simplification_np.max(), 0.01))  # Limit to reasonable range
+    plt.ylim(0, max(prob_mesh_simp_np.max(), 0.01))  # Limit to reasonable range
+    
+    # Add diagonal line for perfect correlation reference
+    max_val = max(plt.xlim()[1], plt.ylim()[1])
+    plt.plot([0, max_val], [0, max_val], 'r--', alpha=0.7)
+    
+    plt.grid(True, alpha=0.3)
+    plt.savefig('simplification_comparison.png', dpi=300)
+    plt.close()
+    
+    print(f"Comparison plot saved as 'simplification_comparison.png'")
+    
+    # Calculate correlation coefficient
+    from scipy.stats import pearsonr
+    
+    # Filter out zeros for better correlation analysis
+    mask = (prob_simplification_np > 0) & (prob_mesh_simp_np > 0)
+    if mask.sum() > 1:  # Need at least 2 points for correlation
+        correlation, p_value = pearsonr(prob_simplification_np[mask], prob_mesh_simp_np[mask])
+        print(f"Pearson correlation coefficient: {correlation:.4f} (p-value: {p_value:.4e})")
+    else:
+        print("Not enough non-zero values to calculate correlation")
+    
+    return {
+        "prob_simplification": prob_simplification,
+        "prob_mesh_simp": prob_mesh_simp,
+        "correlation_plot_path": "simplification_comparison.png"
+    }
 
 
 @torch.no_grad()

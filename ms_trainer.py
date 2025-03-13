@@ -489,6 +489,7 @@ class Runner:
 
         rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
 
+        torch.cuda.synchronize()
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -511,6 +512,7 @@ class Runner:
             camera_model=self.cfg.camera_model,
             **kwargs,
         )
+        torch.cuda.synchronize()
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
