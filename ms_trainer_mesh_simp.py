@@ -73,7 +73,8 @@ class Config:
     target_num_gaussians: Optional[int] = None
 
     ascending: bool = False
-    disable_mean: bool = False
+    use_mean: bool = False
+    sampling: bool = False
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
@@ -103,7 +104,7 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [14999, 15001, 19999, 20001, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [30_000])
     # Whether to save ply file (storage size can be large)
@@ -897,7 +898,7 @@ class Runner:
                         scene_scale=self.scene_scale,
                         optimizers=self.optimizers,
                         ascending=cfg.ascending,
-                        disable_mean=cfg.disable_mean
+                        use_mean=cfg.use_mean
                     )
                     
                     print("Number of Gaussians before simplification: ", n_gaussians)
@@ -972,7 +973,8 @@ class Runner:
                         scene_scale=self.scene_scale,
                         optimizers=self.optimizers,
                         ascending=cfg.ascending,
-                        disable_mean=cfg.disable_mean
+                        use_mean=cfg.use_mean,
+                        sampling=cfg.sampling
                     )
                     
                     print("Number of Gaussians before simplification: ", n_gaussians)

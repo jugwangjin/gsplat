@@ -355,7 +355,8 @@ def simplification_from_mesh_simp(
     optimizers=None,
     abs_ratio=False,
     ascending=False,
-    disable_mean = False,
+    use_mean = False,
+    sampling = False,
 ):
     
     trainloader = torch.utils.data.DataLoader(
@@ -412,11 +413,25 @@ def simplification_from_mesh_simp(
         if torch.isnan(increased_losses).any():
             exit()
 
-    if not disable_mean:
+    accumulated_increased_losses = accumulated_increased_losses + torch.amin(accumulated_increased_losses)  # since accumulated_increased_losses can have negative values
+
+    if use_mean:
         accumulated_increased_losses /= accumulated_weights_counts.clamp(min=1)
 
     # indices to keep
-    indices = torch.argsort(accumulated_increased_losses, descending=False if ascending else True)[:int(n_gaussian * sampling_factor)]
+    if not sampling:
+        indices = torch.argsort(accumulated_increased_losses, descending=False if ascending else True)[:int(n_gaussian * sampling_factor)]
+    else:
+        # same as simplification - making prob 
+        # inverse_losses = 1.0 / (accumulated_increased_losses + 1e-10)  # Add small epsilon to avoid division by zero
+
+        prob_mesh_simp = accumulated_increased_losses / accumulated_increased_losses.sum()
+        prob_mesh_simp = prob_mesh_simp.cpu().numpy()
+
+        n_sample = int(n_gaussian * sampling_factor)
+
+        indices = np.random.choice(n_gaussian, n_sample, p=prob_mesh_simp, replace=False)
+
     
 
     # indices_ = torch.argsort(accumulated_increased_losses, descending=False)[:int(n_gaussian * sampling_factor)]
@@ -543,10 +558,11 @@ def compare_simplifications(
             accumulated_weights_valid_mask = batch_pixels_per_gaussian > 0
             importance_scores[accumulated_weights_valid_mask] += importance_score[accumulated_weights_valid_mask]
  
-    importance_scores[pixels_per_gaussian == 0] = 0
+    # importance_scores[pixels_per_gaussian == 0] = 0
     
     # Calculate probability for simplification method
     prob_simplification = importance_scores / importance_scores.sum()
+
     
     # Reset trainloader for second method
     trainloader = torch.utils.data.DataLoader(
@@ -601,29 +617,31 @@ def compare_simplifications(
     
     # For simplification_from_mesh_simp, we use inverse of accumulated_increased_losses
     # since lower loss means higher importance
-    inverse_losses = 1.0 / (accumulated_increased_losses + 1e-10)  # Add small epsilon to avoid division by zero
     
     # Calculate probability for simplification_from_mesh_simp method
-    prob_mesh_simp = inverse_losses / inverse_losses.sum()
+    accumulated_increased_losses = accumulated_increased_losses + torch.amin(accumulated_increased_losses)  # since accumulated_increased_losses can have negative values
+    prob_mesh_simp = accumulated_increased_losses / accumulated_increased_losses.sum()
     
     # before plotting, normalize both to have range of [0, 1]
-    prob_simplification = prob_simplification / torch.amax(prob_simplification)
-    prob_mesh_simp = prob_mesh_simp / torch.amax(prob_mesh_simp)
+    # prob_simplification = prob_simplification / torch.amax(prob_simplification)
+    # prob_mesh_simp = prob_mesh_simp / torch.amax(prob_mesh_simp)
 
     # Convert to numpy for plotting
     prob_simplification_np = prob_simplification.cpu().numpy()
     prob_mesh_simp_np = prob_mesh_simp.cpu().numpy()
     
     # Plot the correlation
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    
+    plt.clf()
     plt.figure(figsize=(10, 8))
-    plt.scatter(prob_simplification_np, prob_mesh_simp_np, alpha=0.5, s=1)
+    plt.scatter(prob_simplification_np, prob_mesh_simp_np, alpha=0.5, s=0.5)
     plt.xlabel('Probability from simplification')
-    plt.ylabel('Probability from simplification_from_mesh_simp (inverse loss)')
+    plt.ylabel('Probability from simplification_from_mesh_simp')
     plt.title('Correlation between simplification methods')
-    plt.xlim(0, max(prob_simplification_np.max(), 0.01))  # Limit to reasonable range
-    plt.ylim(0, max(prob_mesh_simp_np.max(), 0.01))  # Limit to reasonable range
+    plt.xlim(0, np.amax(prob_simplification_np))  # Limit to reasonable range
+    plt.ylim(0, np.amax(prob_mesh_simp_np))  # Limit to reasonable range
     
     # Add diagonal line for perfect correlation reference
     max_val = max(plt.xlim()[1], plt.ylim()[1])

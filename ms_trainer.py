@@ -91,13 +91,13 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 14999, 15001, 19999, 20001, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [30_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [30_000])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -1057,7 +1057,7 @@ class Runner:
                 # max_ids_img = visualize_id_maps(info['max_ids'][..., -1])
                 # canvas_list.append(max_ids_img)                
 
-            print("write images")
+            # print("write images")
             if world_rank == 0:
                 # write images
                 canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
@@ -1066,7 +1066,7 @@ class Runner:
                     f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
                     canvas,
                 )
-                print(f"{self.render_dir}/{stage}_step{step}_{i:04d}.png")
+                # print(f"{self.render_dir}/{stage}_step{step}_{i:04d}.png")
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 metrics["psnr"].append(self.psnr(colors_p, pixels_p))

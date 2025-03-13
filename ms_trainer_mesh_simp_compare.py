@@ -28,7 +28,7 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from fused_ssim import fused_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, visualize_id_maps, depth_reinitialization, simplification, simplification_from_mesh_simp
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, visualize_id_maps, depth_reinitialization, simplification, simplification_from_mesh_simp, compare_simplifications
 from lib_bilagrid import (
     BilateralGrid,
     slice,
@@ -73,7 +73,7 @@ class Config:
     target_num_gaussians: Optional[int] = None
 
     ascending: bool = False
-    disable_mean: bool = False
+    use_mean: bool = False
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
@@ -103,7 +103,7 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [14999, 15001, 19999, 20001, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [30_000])
     # Whether to save ply file (storage size can be large)
@@ -897,7 +897,7 @@ class Runner:
                         scene_scale=self.scene_scale,
                         optimizers=self.optimizers,
                         ascending=cfg.ascending,
-                        disable_mean=cfg.disable_mean
+                        use_mean=cfg.use_mean
                     )
                     
                     print("Number of Gaussians before simplification: ", n_gaussians)
@@ -956,7 +956,7 @@ class Runner:
                 
                 if (step+1) in simplification_iters:
                     n_gaussians = len(self.splats["means"])
-                    self.splats, self.optimizers = simplification_from_mesh_simp(
+                    self.splats, self.optimizers = compare_simplifications(
                         trainset = self.trainset,
                         runner = self,
                         parser = self.parser,
@@ -971,10 +971,8 @@ class Runner:
                         init_scale=cfg.init_scale,
                         scene_scale=self.scene_scale,
                         optimizers=self.optimizers,
-                        ascending=cfg.ascending,
-                        disable_mean=cfg.disable_mean
                     )
-                    
+                    exit()
                     print("Number of Gaussians before simplification: ", n_gaussians)
                     print("Number of Gaussians after simplification: ", len(self.splats["means"]))
 
