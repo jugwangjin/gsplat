@@ -207,7 +207,7 @@ def simplification(
     init_scale: float = 1.0,
     scene_scale: float = 1.0,
     optimizers=None,
-    abs_ratio=False
+    abs_ratio=False,
 ):
     
     trainloader = torch.utils.data.DataLoader(
@@ -413,7 +413,11 @@ def simplification_from_mesh_simp(
         if torch.isnan(increased_losses).any():
             exit()
 
-    accumulated_increased_losses = accumulated_increased_losses + torch.amin(accumulated_increased_losses)  # since accumulated_increased_losses can have negative values
+    # Add fixed pruning indices: that accumulated_increased_losses < 0
+    fixed_pruning_indices = accumulated_increased_losses < 0
+    fixed_pruning_indices = torch.nonzero(fixed_pruning_indices, as_tuple=True)[0]
+
+    accumulated_increased_losses = accumulated_increased_losses - torch.amin(accumulated_increased_losses)  # since accumulated_increased_losses can have negative values
 
     if use_mean:
         accumulated_increased_losses /= accumulated_weights_counts.clamp(min=1)
@@ -421,6 +425,7 @@ def simplification_from_mesh_simp(
     # indices to keep
     if not sampling:
         indices = torch.argsort(accumulated_increased_losses, descending=False if ascending else True)[:int(n_gaussian * sampling_factor)]
+        
     else:
         # same as simplification - making prob 
         # inverse_losses = 1.0 / (accumulated_increased_losses + 1e-10)  # Add small epsilon to avoid division by zero
@@ -431,8 +436,10 @@ def simplification_from_mesh_simp(
         n_sample = int(n_gaussian * sampling_factor)
 
         indices = np.random.choice(n_gaussian, n_sample, p=prob_mesh_simp, replace=False)
-
     
+    # remove fixed pruning indices
+    # the indices is the indices for keeping
+    indices = [i for i in indices if i not in fixed_pruning_indices]
 
     # indices_ = torch.argsort(accumulated_increased_losses, descending=False)[:int(n_gaussian * sampling_factor)]
     # print("descending", torch.sigmoid(runner.splats["opacities"][indices_]).min(), torch.sigmoid(runner.splats["opacities"][indices_]).max(),\
@@ -619,7 +626,7 @@ def compare_simplifications(
     # since lower loss means higher importance
     
     # Calculate probability for simplification_from_mesh_simp method
-    accumulated_increased_losses = accumulated_increased_losses + torch.amin(accumulated_increased_losses)  # since accumulated_increased_losses can have negative values
+    accumulated_increased_losses = accumulated_increased_losses - torch.amin(accumulated_increased_losses)  # since accumulated_increased_losses can have negative values
     prob_mesh_simp = accumulated_increased_losses / accumulated_increased_losses.sum()
     
     # before plotting, normalize both to have range of [0, 1]
