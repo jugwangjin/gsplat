@@ -47,7 +47,7 @@ from gsplat.utils import save_ply
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # Name of compression strategy to use
@@ -310,6 +310,8 @@ class Runner:
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
+        self.error_dir = f"{cfg.result_dir}/errors"
+        os.makedirs(self.error_dir, exist_ok=True)
         self.ply_dir = f"{cfg.result_dir}/ply"
         os.makedirs(self.ply_dir, exist_ok=True)
 
@@ -1066,6 +1068,27 @@ class Runner:
                     f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
                     canvas,
                 )
+
+
+                # Compute and write error map (L1 loss rendered as grayscale)
+                error_map = torch.abs(colors - pixels)  # [1, H, W, 3]
+                error_map = error_map.mean(dim=-1, keepdim=True)  # [1, H, W, 1] to get a grayscale map
+                # Squeeze the batch and channel dimensions to get a [H, W] array
+                error_map_np = error_map.squeeze(0).squeeze(-1).cpu().numpy()  
+                error_map_np = (error_map_np * 255).astype(np.uint8)
+                imageio.imwrite(
+                    f"{self.error_dir}/{stage}_step{step}_{i:04d}_error.png",
+                    error_map_np,
+                )
+                # alpha map 
+                alpha_map = alphas.squeeze(0).squeeze(-1).cpu().numpy()
+                alpha_map = (alpha_map * 255).astype(np.uint8)
+                imageio.imwrite(
+                    f"{self.alpha_dir}/{stage}_step{step}_{i:04d}_alpha.png",
+                    alpha_map,
+                )
+                
+                
                 # print(f"{self.render_dir}/{stage}_step{step}_{i:04d}.png")
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]

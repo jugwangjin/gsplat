@@ -88,6 +88,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     // keep not rasterizing threads around for reading data
     bool inside = (i < image_height && j < image_width);
     bool done = !inside;
+    bool done_ = !inside;
 
     // when the mask is provided, render the background color and return
     // if this tile is labeled as False
@@ -228,7 +229,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     }
 
 
-    if (gt_image != nullptr){
+    if (inside && gt_image != nullptr){
         // Only cover 3D (RGB) gt_image, no matter how many dimensions the rendered images or gt_image have. 
         
         // Accumulate again, computing the potential error when we omit each gaussian
@@ -244,12 +245,12 @@ __global__ void rasterize_to_pixels_fwd_kernel(
         S remaining_color[COLOR_DIM] = {0.0f};
         S expected_color[COLOR_DIM] = {0.0f};
         S potential_loss[3] = {0.0f};
-        S expected_loss_inc;
+        S expected_loss_inc = 0.0f;
         
         for (uint32_t b = 0; b < num_batches; ++b) {
             // resync all threads before beginning next batch
             // end early if entire tile is done
-            if (__syncthreads_count(done) >= block_size) {
+            if (__syncthreads_count(done_) >= block_size) {
                 break;
             }
 
@@ -278,7 +279,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             // the size of array can be calculated by the for loop's condition
             // but we use block_size for simplicity
 
-            for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
+            for (uint32_t t = 0; (t < batch_size) && !done_; ++t) {
                 const vec3<S> conic = conic_batch[t];
                 const vec3<S> xy_opac = xy_opacity_batch[t];
                 const S opac = xy_opac.z;
@@ -293,7 +294,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
                 const S next_T = T_ * (1.0f - alpha);
                 if (next_T <= 1e-4) { // this pixel is done: exclusive
-                    done = true;
+                    done_ = true;
                     break;
                 }
 
@@ -359,6 +360,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
     }
 }
+
 
 template <uint32_t CDIM>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(

@@ -71,10 +71,12 @@ class Config:
     sampling_factor: float = 0.3
     target_final_sampling_factor: Optional[float] = None
     target_num_gaussians: Optional[int] = None
+    designated_sampling_factors: Optional[List[float]] = None
 
     ascending: bool = False
     use_mean: bool = False
     sampling: bool = False
+    simplification_iterations: int = 1
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
@@ -323,6 +325,10 @@ class Runner:
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
+        self.error_dir = f"{cfg.result_dir}/errors"
+        os.makedirs(self.error_dir, exist_ok=True)
+        self.alpha_dir = f"{cfg.result_dir}/alphas"
+        os.makedirs(self.alpha_dir, exist_ok=True)
         self.ply_dir = f"{cfg.result_dir}/ply"
         os.makedirs(self.ply_dir, exist_ok=True)
 
@@ -598,6 +604,11 @@ class Runner:
         simplification_iters = list(range(simplification_strat_step, simplification_end_step+1, (simplification_end_step - simplification_strat_step) // (simplification_num-1)))
         print('simplification_iters:', simplification_iters)
         print('simplification_start_step:', simplification_strat_step, 'simplification_end_step:', simplification_end_step, 'simplification_num:', simplification_num)
+
+        if cfg.designated_sampling_factors is not None: 
+            cfg.simplification_num = len(cfg.designated_sampling_factors)
+            simplification_num = cfg.simplification_num
+            simplification_iters = list(range(simplification_strat_step, simplification_end_step+1, (simplification_end_step - simplification_strat_step) // (simplification_num-1)))
 
         pbar = tqdm.tqdm(range(init_step))
         for step in pbar:
@@ -957,12 +968,18 @@ class Runner:
                 
                 if (step+1) in simplification_iters:
                     n_gaussians = len(self.splats["means"])
+
+                    if cfg.designated_sampling_factors is not None:
+                        cur_sampling_factor = cfg.designated_sampling_factors[simplification_iters.index(step+1)]
+                    else:
+                        cur_sampling_factor = cfg.sampling_factor
+
                     self.splats, self.optimizers = simplification_from_mesh_simp(
                         trainset = self.trainset,
                         runner = self,
                         parser = self.parser,
                         cfg = self.cfg,
-                        sampling_factor = cfg.sampling_factor,
+                        sampling_factor = cur_sampling_factor,
                         keep_sh0 = True,
                         keep_feats = True,
                         batch_size=cfg.batch_size,
@@ -974,7 +991,8 @@ class Runner:
                         optimizers=self.optimizers,
                         ascending=cfg.ascending,
                         use_mean=cfg.use_mean,
-                        sampling=cfg.sampling
+                        sampling=cfg.sampling,
+                        iterations=cfg.simplification_iterations
                     )
                     
                     print("Number of Gaussians before simplification: ", n_gaussians)
@@ -1112,6 +1130,26 @@ class Runner:
                     f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
                     canvas,
                 )
+
+                # Compute and write error map (L1 loss rendered as grayscale)
+                error_map = torch.abs(colors - pixels)  # [1, H, W, 3]
+                error_map = error_map.mean(dim=-1, keepdim=True)  # [1, H, W, 1] to get a grayscale map
+                # Squeeze the batch and channel dimensions to get a [H, W] array
+                error_map_np = error_map.squeeze(0).squeeze(-1).cpu().numpy()  
+                error_map_np = (error_map_np * 255).astype(np.uint8)
+                imageio.imwrite(
+                    f"{self.error_dir}/{stage}_step{step}_{i:04d}_error.png",
+                    error_map_np,
+                )
+
+                # alpha map 
+                alpha_map = alphas.squeeze(0).squeeze(-1).cpu().numpy()
+                alpha_map = (alpha_map * 255).astype(np.uint8)
+                imageio.imwrite(
+                    f"{self.alpha_dir}/{stage}_step{step}_{i:04d}_alpha.png",
+                    alpha_map,
+                )
+                
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 metrics["psnr"].append(self.psnr(colors_p, pixels_p))
