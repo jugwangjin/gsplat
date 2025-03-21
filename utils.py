@@ -552,6 +552,10 @@ def simplification_progressive(
 
     The synergy aggregator is done using a "sum of all removed" approach in the snippet below.
     """
+    # Chunk sizes for sub-batches
+    chunk_size_alive = int(chunk_size_alive)
+    chunk_size_removed = int(chunk_size_removed)
+
 
     device = runner.splats["means"].device
     n_gaussian_initial = runner.splats["means"].shape[0]
@@ -662,146 +666,79 @@ def simplification_progressive(
         synergy_update = torch.zeros(n_gaussian, device=device)
         n_gaussians_current = n_gaussian
 
-        # Decide how big each chunk removal is. e.g.:
-        #  => "expected_removals // 500" or some other formula
-        # Next line is the typical approach, but tweak as needed:
         relative_removal_chunk = max(1, expected_removals // max_removal_iterations)
-        # Also clamp it by e.g. 5000 if you want an upper bound:
-        # relative_removal_chunk = min(5000, max(1, expected_removals // 500))
 
-        # Start removing
+        potential_loss = potential_loss.contiguous()
+        synergy_update = synergy_update.contiguous()
+        alive_mask = alive_mask.contiguous()
+
         pbar = tqdm.tqdm(total=expected_removals, desc="Simplification progress")
+
         while n_gaussians_current > gaussians_to_keep:
-            block_start = time.time()
-            chunk_to_remove = min(relative_removal_chunk,
-                                  n_gaussians_current - gaussians_to_keep)
+            chunk_to_remove = min(relative_removal_chunk, n_gaussians_current - gaussians_to_keep)
             if chunk_to_remove <= 0:
                 break
 
-
             # Effective potential
             effective_loss = potential_loss * (1.0 + synergy_update)
-            alive_loss = effective_loss[alive_mask]
 
-            sampling_start = time.time()
+            # Alive loss processing
+            global_alive_indices = alive_mask.nonzero(as_tuple=True)[0]
+            global_alive_indices = global_alive_indices.sort().values
+            alive_loss = effective_loss.gather(0, global_alive_indices)
 
-            # pick chunk_to_remove gaussians (lowest or random sample)
+            # Sampling
             if sampling:
                 chosen_local_idx = torch.multinomial(alive_loss, num_samples=chunk_to_remove, replacement=False)
             else:
                 _, chosen_local_idx = torch.topk(alive_loss, k=chunk_to_remove, largest=False)
 
-            sampling_end = time.time()
-
-
-
-            global_alive_indices = alive_mask.nonzero(as_tuple=True)[0]
+            # Determine global indices
             chosen_global_idx = global_alive_indices[chosen_local_idx]
 
-            # aggregator synergy approach
+            # Aggregator synergy approach
             removed_positions = means[chosen_global_idx]
             removed_opacities = opacities[chosen_global_idx]
-
-            # still_alive_global = alive_mask.nonzero(as_tuple=True)[0]
             alive_positions = means[global_alive_indices]
             M = alive_positions.shape[0]
 
             synergy_total = torch.zeros(M, device=device)
 
-            chunk_size_alive = int(chunk_size_alive)
-            chunk_size_removed = int(chunk_size_removed)
-
-            update_start = time.time()
             startA = 0
             while startA < M:
                 endA = min(startA + chunk_size_alive, M)
-                batch_positions = alive_positions[startA:endA]  # shape [A, 3]
+                batch_positions = alive_positions[startA:endA]
                 A = batch_positions.shape[0]
 
-                # we'll accumulate synergy for this sub-batch
                 synergy_sub = torch.zeros(A, device=device)
 
-                # Now chunk over the removed Gaussians
+                # Chunk over removed Gaussians
                 R = removed_positions.shape[0]
                 startR = 0
                 while startR < R:
-                    get_chunk_start = time.time()
                     endR = min(startR + chunk_size_removed, R)
-                    sub_removed_positions = removed_positions[startR:endR]   # shape [R_sub, 3]
-                    sub_removed_opacities = removed_opacities[startR:endR]   # shape [R_sub]
+                    sub_removed_positions = removed_positions[startR:endR]
+                    sub_removed_opacities = removed_opacities[startR:endR]
 
-                    get_chunk_end = time.time()
+                    dist = torch.cdist(batch_positions, sub_removed_positions, p=2)
+                    alpha_exp = sub_removed_opacities * torch.exp(-dist * distance_sigma / dist_avg)
+                    synergy_sub += alpha_exp.sum(dim=1)
 
-                    # Now compute distances for this sub-block
-                    # batch_positions: shape [A, 3]
-                    # sub_removed_positions: shape [R_sub, 3]
-                    # diff = (batch_positions.unsqueeze(1) - sub_removed_positions.unsqueeze(0))
-                    # shape [A, R_sub, 3]
+                    startR = endR
 
-                    # dist_sq = diff.pow(2).sum(dim=2)         # shape [A, R_sub]
-                    # dist = dist_sq.sqrt()                    # shape [A, R_sub]
-
-                    dist_start = time.time()
-                    dist = torch.cdist(batch_positions, sub_removed_positions, p=2)  # shape [A, R_sub]
-
-                    dist_end = time.time()
-
-                    alpha_exp_start = time.time()
-                    # aggregator: sum of alpha_k * exp(- dist * distance_sigma / dist_avg)
-                    alpha_exp = sub_removed_opacities * torch.exp(
-                        -dist * distance_sigma / dist_avg
-                    )  # shape [A, R_sub]
-
-                    # sum across the sub-removed chunk
-                    synergy_sub_chunk = alpha_exp.sum(dim=1)  # shape [A]
-
-                    alpha_exp_end = time.time()
-
-                    adding_start = time.time()
-                    synergy_sub += synergy_sub_chunk  # accumulate partial synergy
-
-                    adding_end = time.time()
-                    startR = endR  # move to next sub-chunk of removed
-                    print(f"Get Chunk: {get_chunk_end - get_chunk_start:.5f}, "
-                          f"Dist: {dist_end - dist_start:.5f}, "
-                          f"Alpha Exp: {alpha_exp_end - alpha_exp_start:.5f}, "
-                          f"Adding: {adding_end - adding_start:.5f}")
-                # store synergy_sub into synergy_total
                 synergy_total[startA:endA] = synergy_sub
-
                 startA = endA
-            update_end = time.time()
-            # synergy_total now holds the sum of synergy from *all* removed gaussians for each alive gaussian.
 
-            actual_update_start = time.time()
-            synergy_factor = synergy_total
-            actual_update_adding_start = time.time()
-            synergy_update[global_alive_indices] += distance_alpha * synergy_factor
-            actual_update_adding_end = time.time()
-
-            # remove
-            masking_update_start = time.time()
-            # alive_mask[chosen_global_idx] = False
-            alive_mask.scatter_(0, chosen_global_idx, torch.zeros_like(chosen_global_idx, dtype=torch.bool))
-            masking_update_end = time.time()
-            n_gaussians_sum_start = time.time()
-            n_gaussians_current = n_gaussians_current - chunk_to_remove
-            n_gaussians_sum_end = time.time()
-
-            actual_update_end = time.time() 
-            block_end = time.time()
+            # Update synergy and remove Gaussians
+            synergy_update[global_alive_indices] += distance_alpha * synergy_total
+            alive_mask.scatter_(0, chosen_global_idx, False)
+            n_gaussians_current -= chunk_to_remove
             pbar.update(chunk_to_remove)
             pbar.set_postfix(remaining=n_gaussians_current, removed=chunk_to_remove)
 
-            print(f"Sampling: {sampling_end - sampling_start:.5f}, "
-                  f"Update: {update_end - update_start:.5f}, "
-                  f"Actual Update: {actual_update_end - actual_update_start:.5f}, "
-                  f"Block: {block_end - block_start:.5f}, "
-                  f"Others: {block_end - block_start - (sampling_end - sampling_start) - (update_end - update_start) - (actual_update_end - actual_update_start):.5f}, "
-                    f"Masking: {masking_update_end - masking_update_start:.5f}, "
-                    f"n_gaussians_sum: {n_gaussians_sum_end - n_gaussians_sum_start:.5f}, "
-                    f"Actual Update Adding: {actual_update_adding_end - actual_update_adding_start:.5f}")                  
         pbar.close()
+
+
 
         # (C) physical prune
         pruning_mask = ~alive_mask
