@@ -534,66 +534,68 @@ def simplification_progressive(
     sampling: bool = True,
     iterations: int = 1,
     # Synergy (local update) parameters:
-    distance_sigma: float = 1,
-    distance_alpha: float = 0.1,
-    removal_chunk: int = 100,
+    distance_sigma: float = 1.0,
+    distance_alpha: float = 1.0,
+    removal_chunk: int = 100,  # default fallback
+    max_removal_iterations: int = 10000,
+    chunk_size_alive: int = 1e7,
+    chunk_size_removed: int = 1e3,
 ):
     """
-    Progressive simplification:
-      1) Repeatedly compute the "true" potential loss by a full forward pass.
-      2) Compute a per-iteration removal target.
-      3) While the number of Gaussians is above the iteration target, remove a small chunk
-         by sampling using torch.multinomial (without explicit normalization) and update
-         the potential loss of neighbors using a distance-based synergy update.
-      4) Physically prune the Gaussians using remove_return.
-      5) Return the new splats and optimizers.
+    Progressive simplification of Gaussians:
+      1. Compute 'true' potential loss by a full forward pass (across the entire dataset).
+      2. Decide how many Gaussians to prune this iteration.
+      3. Repeatedly remove small chunks of Gaussians (size = removal_chunk or a dynamic calculation),
+         while performing synergy updates to partially reflect that newly removed Gaussians
+         have further 'exposed' certain behind Gaussians.
+      4. Prune them physically from runner.splats.
 
-    The full potential loss is re-computed at the start of each iteration.
+    The synergy aggregator is done using a "sum of all removed" approach in the snippet below.
     """
+
     device = runner.splats["means"].device
     n_gaussian_initial = runner.splats["means"].shape[0]
-    
-    if sampling_factor > 1:
-        return runner.splats, optimizers
 
+    # 1) Compute target_n_gaussian
+    if sampling_factor > 1:
+        # if user provides sampling_factor>1, do nothing
+        return runner.splats, optimizers
     target_n_gaussian = int(n_gaussian_initial * sampling_factor)
     if target_n_gaussian < 1:
-        target_n_gaussian = 1  # Clamp at least 1 remains
+        target_n_gaussian = 1
 
-
-    # Compute overall number to remove per iteration
-    # (Total removals will be evenly distributed among iterations)
+    # 2) Overall number to remove
     total_to_remove = n_gaussian_initial - target_n_gaussian
 
-    simplification_start = time.time()
-
+    # 3) How many to remove "per iteration"
     pruned_gaussian_per_iteration = total_to_remove // iterations
 
-    print(f"Initial Gaussians: {n_gaussian_initial}, Target: {target_n_gaussian}, "
-          f"removing {pruned_gaussian_per_iteration} per iteration (approx).")
+    print(f"Initial Gaussians: {n_gaussian_initial}, "
+          f"Target: {target_n_gaussian}, "
+          f"Removing ~{pruned_gaussian_per_iteration} each iteration, "
+          f"for {iterations} iterations.")
 
-
-    means = runner.splats["means"].detach()  # shape [n_gaussian, 3]
-    dist2_avg = (knn(means, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    # Some logic for synergy aggregator scale:
+    means = runner.splats["means"].detach()  # shape [N, 3]
+    # Suppose we compute an average 'dist_avg' from 3-nn
+    dist2_avg = (knn(means, 4)[:, 1:] ** 2).mean(dim=-1)  # shape [N]
     dist_avg = torch.sqrt(dist2_avg.clamp(1e-6)).mean().item()
+    print(f"dist_avg ~ {dist_avg:.4f} (scene scale)")
 
-    # Outer loop: each iteration recomputes the "true" potential loss.
-    for iteration in tqdm.tqdm(range(iterations)):
-        iter_start = time.time()
-        torch.cuda.synchronize()
+    # Timers
+    simplification_start = time.time()
 
-        # Update current number of Gaussians from the current splats.
+    # ---------------------------------------------------------------
+    # Outer Loop: repeated iteration
+    # ---------------------------------------------------------------
+    for iteration in tqdm.tqdm(range(iterations), desc="ProgressiveSimplify"):
+        # (A) Recompute potential_loss
         n_gaussian = runner.splats["means"].shape[0]
-        # For this iteration, we want to keep:
         gaussians_to_keep = n_gaussian - pruned_gaussian_per_iteration
-        # print(f"Iteration {iteration+1}: Current Gaussians: {n_gaussian}, "
-        #       f"Goal for iteration: keep {gaussians_to_keep}.")
-        
-        expected_removals = n_gaussian - gaussians_to_keep
+        expected_removals = max(0, n_gaussian - gaussians_to_keep)
 
-        # ---------------------------------------------------------------------------------
-        # 1) FULL FORWARD PASS TO RE-COMPUTE POTENTIAL LOSS (True Loss)
-        # ---------------------------------------------------------------------------------
+        # 1) Full forward pass => potential_loss
+        # Setup the DataLoader:
         trainloader = torch.utils.data.DataLoader(
             trainset,
             batch_size=1,
@@ -607,8 +609,8 @@ def simplification_progressive(
         potential_loss = torch.zeros(n_gaussian, device=device)
         weights_count = torch.zeros(n_gaussian, device=device)
 
+        # Full pass: accumulate potential_loss
         for _ in tqdm.tqdm(range(len(trainloader)), desc="Compute potential loss"):
-            # dataload_start = time.time()
             data = next(trainloader_iter)
 
             pixel = data["image"].to(device) / 255.0
@@ -617,13 +619,8 @@ def simplification_progressive(
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None
 
-            # dataload_time = time.time() - dataload_start
-# 
             height, width = pixel.shape[1:3]
 
-            # render_start = time.time()
-
-            # Forward pass; assumed to output info with "accumulated_potential_loss"
             _, _, info = runner.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -639,140 +636,205 @@ def simplification_progressive(
             )
             incr_loss = info["accumulated_potential_loss"]
             incr_count = info["accumulated_weights_count"]
+
+            # If shape is [C, N], sum over cameras
             if incr_loss.dim() == 2:
                 incr_loss = incr_loss.sum(dim=0)
                 incr_count = incr_count.sum(dim=0)
-            pix_per_image = width * height
-            potential_loss += (incr_loss / pix_per_image)
+
+            potential_loss += incr_loss
             weights_count += incr_count
 
-            # render_time = time.time() - render_start
-
-            # print(f"Data load time: {dataload_time:.2f} sec, Render time: {render_time:.2f} sec.")
-
-        # Normalize potential_loss so that all entries are >= 0
-        min_val = potential_loss.min()
-        if min_val < 0:
-            potential_loss -= min_val
+        # Possibly do the averaging
         if use_mean:
             potential_loss /= weights_count.clamp_min(1)
 
+        # Shift up to ensure no negative
+        min_val = potential_loss.min()
+        if min_val < 0:
+            potential_loss -= min_val
 
-        # -------------------------------------------------------------------------
-        # 2) PROGRESSIVELY REMOVE GAUSSIANS (LOCAL SYNERGY UPDATE)
-        # -------------------------------------------------------------------------
-        # alive_mask tracks the Gaussians that remain.
+        # (B) synergy loop: remove small chunks
         alive_mask = torch.ones(n_gaussian, dtype=torch.bool, device=device)
-        # We use the current positions from runner.splats["means"].
-        means = runner.splats["means"].detach()  # shape [n_gaussian, 3]
+        means = runner.splats["means"].detach()
+        opacities = torch.sigmoid(runner.splats["opacities"].detach())
 
-        # Initialize a separate synergy_update array to accumulate additive updates.
         synergy_update = torch.zeros(n_gaussian, device=device)
-
         n_gaussians_current = n_gaussian
-        local_iter = 0
 
-        # Create a tqdm progress bar for the removals.
-        relative_removal_chunk = min(1000, max(1, expected_removals // 1000))
+        # Decide how big each chunk removal is. e.g.:
+        #  => "expected_removals // 500" or some other formula
+        # Next line is the typical approach, but tweak as needed:
+        relative_removal_chunk = max(1, expected_removals // max_removal_iterations)
+        # Also clamp it by e.g. 5000 if you want an upper bound:
+        # relative_removal_chunk = min(5000, max(1, expected_removals // 500))
 
-
+        # Start removing
         pbar = tqdm.tqdm(total=expected_removals, desc="Simplification progress")
         while n_gaussians_current > gaussians_to_keep:
-            local_iter += 1
-
-            removal_chunk = min(relative_removal_chunk, n_gaussians_current - gaussians_to_keep)
-
-            # Compute effective potential loss used for sampling.
-            effective_loss = potential_loss * (1.0 + synergy_update)
-            alive_loss = effective_loss[alive_mask]
-            if alive_loss.sum() < 1e-12:
-                print("Effective potential loss is near zero; breaking out.")
+            block_start = time.time()
+            chunk_to_remove = min(relative_removal_chunk,
+                                  n_gaussians_current - gaussians_to_keep)
+            if chunk_to_remove <= 0:
                 break
 
 
-                # print('alive_loss', alive_loss.min(), alive_loss.max(), alive_loss.mean(), alive_loss.std(), alive_loss.shape)
+            # Effective potential
+            effective_loss = potential_loss * (1.0 + synergy_update)
+            alive_loss = effective_loss[alive_mask]
 
-            # Sample a chunk of indices (removal_chunk) among alive Gaussians.
-            # --- Conditional Sampling ---
+            sampling_start = time.time()
+
+            # pick chunk_to_remove gaussians (lowest or random sample)
             if sampling:
-                # Use torch.multinomial.
-                chosen_local_idx = torch.multinomial(alive_loss, num_samples=removal_chunk, replacement=False)
+                chosen_local_idx = torch.multinomial(alive_loss, num_samples=chunk_to_remove, replacement=False)
             else:
-                # Use torch.topk to choose removals deterministically (lowest effective_loss).
-                _, chosen_local_idx = torch.topk(alive_loss, k=removal_chunk, largest=False)
+                _, chosen_local_idx = torch.topk(alive_loss, k=chunk_to_remove, largest=False)
+
+            sampling_end = time.time()
 
 
-            # chosen_local_idx = torch.multinomial(alive_loss, num_samples=removal_chunk, replacement=False)
+
             global_alive_indices = alive_mask.nonzero(as_tuple=True)[0]
             chosen_global_idx = global_alive_indices[chosen_local_idx]
 
-            # Vectorized synergy update:
-            removed_positions = means[chosen_global_idx]  # shape [chunk, 3]
-            still_alive_global = alive_mask.nonzero(as_tuple=True)[0]  # shape [M]
-            alive_positions = means[still_alive_global]  # shape [M, 3]
+            # aggregator synergy approach
+            removed_positions = means[chosen_global_idx]
+            removed_opacities = opacities[chosen_global_idx]
 
-
+            # still_alive_global = alive_mask.nonzero(as_tuple=True)[0]
+            alive_positions = means[global_alive_indices]
             M = alive_positions.shape[0]
-            chunk_size = int(1e6)  # or 1,000_000 as an integer
-                        
-            min_dists = []
-            start = 0
-            while start < M:
-                end = min(start + chunk_size, M)
-                batch = alive_positions[start:end]  # shape [batch_size, 3]
 
-                # Now compute the difference for just this batch:
-                diff = batch.unsqueeze(1) - removed_positions.unsqueeze(0)  # shape [batch_size, chunk, 3]
-                dist_sq = diff.pow(2).sum(dim=2)  # [batch_size, chunk]
-                batch_min_dist, _ = dist_sq.sqrt().min(dim=1)  # [batch_size]
+            synergy_total = torch.zeros(M, device=device)
 
-                min_dists.append(batch_min_dist)
+            chunk_size_alive = int(chunk_size_alive)
+            chunk_size_removed = int(chunk_size_removed)
 
-                start = end
+            update_start = time.time()
+            startA = 0
+            while startA < M:
+                endA = min(startA + chunk_size_alive, M)
+                batch_positions = alive_positions[startA:endA]  # shape [A, 3]
+                A = batch_positions.shape[0]
 
-            # Now concatenate them into one big [M] array
-            min_dist = torch.cat(min_dists, dim=0)  # shape [M]
+                # we'll accumulate synergy for this sub-batch
+                synergy_sub = torch.zeros(A, device=device)
 
-            # print('dis',min_dist.min(), min_dist.max(), min_dist.mean(), min_dist.std())
+                # Now chunk over the removed Gaussians
+                R = removed_positions.shape[0]
+                startR = 0
+                while startR < R:
+                    get_chunk_start = time.time()
+                    endR = min(startR + chunk_size_removed, R)
+                    sub_removed_positions = removed_positions[startR:endR]   # shape [R_sub, 3]
+                    sub_removed_opacities = removed_opacities[startR:endR]   # shape [R_sub]
 
-            synergy_factor = torch.exp(-min_dist * distance_sigma / dist_avg)
+                    get_chunk_end = time.time()
 
-            # print('syn', synergy_factor.min(), synergy_factor.max(), synergy_factor.mean(), synergy_factor.std())
-            # Exclude the ones chosen for removal:
-            mask = ~torch.isin(still_alive_global, chosen_global_idx)
-            update_indices = still_alive_global[mask]
-            update_synergy = synergy_factor[mask]
-            # Instead of directly multiplying potential_loss, accumulate additively in synergy_update.
-            synergy_update[update_indices] += distance_alpha * update_synergy
+                    # Now compute distances for this sub-block
+                    # batch_positions: shape [A, 3]
+                    # sub_removed_positions: shape [R_sub, 3]
+                    # diff = (batch_positions.unsqueeze(1) - sub_removed_positions.unsqueeze(0))
+                    # shape [A, R_sub, 3]
 
-            # Mark the chosen ones as removed.
-            alive_mask[chosen_global_idx] = False
-            n_gaussians_current = alive_mask.sum().item()
+                    # dist_sq = diff.pow(2).sum(dim=2)         # shape [A, R_sub]
+                    # dist = dist_sq.sqrt()                    # shape [A, R_sub]
 
-            pbar.update(removal_chunk)
-            pbar.set_postfix(remaining=n_gaussians_current)
+                    dist_start = time.time()
+                    dist = torch.cdist(batch_positions, sub_removed_positions, p=2)  # shape [A, R_sub]
+
+                    dist_end = time.time()
+
+                    alpha_exp_start = time.time()
+                    # aggregator: sum of alpha_k * exp(- dist * distance_sigma / dist_avg)
+                    alpha_exp = sub_removed_opacities * torch.exp(
+                        -dist * distance_sigma / dist_avg
+                    )  # shape [A, R_sub]
+
+                    # sum across the sub-removed chunk
+                    synergy_sub_chunk = alpha_exp.sum(dim=1)  # shape [A]
+
+                    alpha_exp_end = time.time()
+
+                    adding_start = time.time()
+                    synergy_sub += synergy_sub_chunk  # accumulate partial synergy
+
+                    adding_end = time.time()
+                    startR = endR  # move to next sub-chunk of removed
+                    print(f"Get Chunk: {get_chunk_end - get_chunk_start:.5f}, "
+                          f"Dist: {dist_end - dist_start:.5f}, "
+                          f"Alpha Exp: {alpha_exp_end - alpha_exp_start:.5f}, "
+                          f"Adding: {adding_end - adding_start:.5f}")
+                # store synergy_sub into synergy_total
+                synergy_total[startA:endA] = synergy_sub
+
+                startA = endA
+            update_end = time.time()
+            # synergy_total now holds the sum of synergy from *all* removed gaussians for each alive gaussian.
+
+            actual_update_start = time.time()
+            synergy_factor = synergy_total
+            actual_update_adding_start = time.time()
+            synergy_update[global_alive_indices] += distance_alpha * synergy_factor
+            actual_update_adding_end = time.time()
+
+            # remove
+            masking_update_start = time.time()
+            # alive_mask[chosen_global_idx] = False
+            alive_mask.scatter_(0, chosen_global_idx, torch.zeros_like(chosen_global_idx, dtype=torch.bool))
+            masking_update_end = time.time()
+            n_gaussians_sum_start = time.time()
+            n_gaussians_current = n_gaussians_current - chunk_to_remove
+            n_gaussians_sum_end = time.time()
+
+            actual_update_end = time.time() 
+            block_end = time.time()
+            pbar.update(chunk_to_remove)
+            pbar.set_postfix(remaining=n_gaussians_current, removed=chunk_to_remove)
+
+            print(f"Sampling: {sampling_end - sampling_start:.5f}, "
+                  f"Update: {update_end - update_start:.5f}, "
+                  f"Actual Update: {actual_update_end - actual_update_start:.5f}, "
+                  f"Block: {block_end - block_start:.5f}, "
+                  f"Others: {block_end - block_start - (sampling_end - sampling_start) - (update_end - update_start) - (actual_update_end - actual_update_start):.5f}, "
+                    f"Masking: {masking_update_end - masking_update_start:.5f}, "
+                    f"n_gaussians_sum: {n_gaussians_sum_end - n_gaussians_sum_start:.5f}, "
+                    f"Actual Update Adding: {actual_update_adding_end - actual_update_adding_start:.5f}")                  
         pbar.close()
 
-        # -------------------------------------------------------------------------
-        # 3) PHYSICAL REMOVAL: UPDATE THE SPLATS VIA remove_return
-        # -------------------------------------------------------------------------
-        pruning_mask = ~alive_mask  # True for Gaussians to remove.
-        splats, optimizers = remove_return(runner.splats, optimizers, runner.strategy_state, pruning_mask)
+        # (C) physical prune
+        pruning_mask = ~alive_mask
+        if keep_feats or iterations != 1:
+            splats, optimizers = remove_return(runner.splats, optimizers,
+                                               runner.strategy_state,
+                                               pruning_mask)
+        else:
+            splats, optimizers = create_splats_and_optimizers_from_data(
+                runner.splats["means"][alive_mask],
+                sh0_to_rgb(runner.splats["sh0"][alive_mask]),
+                runner=runner,
+                device=device,
+                batch_size=batch_size,
+                sparse_grad=sparse_grad,
+                visible_adam=visible_adam,
+                world_size=world_size,
+                init_scale=init_scale,
+                scene_scale=scene_scale,
+                shN=runner.splats["shN"][alive_mask] if keep_feats else None,
+                scales=runner.splats["scales"][alive_mask] if keep_feats else None,
+                quats=runner.splats["quats"][alive_mask] if keep_feats else None,
+                opacities=runner.splats["opacities"][alive_mask] if keep_feats else None,
+                optimizers=optimizers,
+                keep_feats=keep_feats,
+                indices=alive_mask.nonzero(as_tuple=True)[0],
+            )
         runner.splats = splats
 
-        n_gaussians_after = runner.splats["means"].shape[0]
-        iter_time = time.time() - iter_start
-        # print(f"Iteration {iteration+1} complete: Reduced from {n_gaussian} to {n_gaussians_after} Gaussians in {iter_time:.2f} sec.")
-
+    n_gaussians_after = runner.splats["means"].shape[0]
     simplification_time = time.time() - simplification_start
-    print(f"Simplification complete, from {n_gaussian_initial} to {n_gaussians_after} Gaussians in {simplification_time:.2f} sec.")
-
+    print(f"Simplification: from {n_gaussian_initial} to {n_gaussians_after} gaussians, in {simplification_time:.2f} sec.")
     return splats, optimizers
-
-
-
-
-
 
 
 
@@ -1324,6 +1386,334 @@ def visualize_id_maps(max_ids: torch.Tensor) -> torch.Tensor:
     output[:, :, :, 2] = b_value / 255.0
 
     return output
+
+
+
+
+
+
+
+
+
+
+
+'''
+
+@torch.no_grad()
+def simplification_progressive(
+    trainset,
+    runner,
+    parser,
+    cfg,
+    sampling_factor: float = 0.1,
+    keep_sh0: bool = True,
+    keep_feats: bool = False,
+    batch_size: int = 1,
+    sparse_grad: bool = False,
+    visible_adam: bool = False,
+    world_size: int = 1,
+    init_scale: float = 1.0,
+    scene_scale: float = 1.0,
+    optimizers=None,
+    ascending: bool = False,
+    use_mean: bool = False,
+    sampling: bool = True,
+    iterations: int = 1,
+    # Synergy (local update) parameters:
+    distance_sigma: float = 1,
+    distance_alpha: float = 1,
+    removal_chunk: int = 100,
+):
+    """
+    Progressive simplification:
+      1) Repeatedly compute the "true" potential loss by a full forward pass.
+      2) Compute a per-iteration removal target.
+      3) While the number of Gaussians is above the iteration target, remove a small chunk
+         by sampling using torch.multinomial (without explicit normalization) and update
+         the potential loss of neighbors using a distance-based synergy update.
+      4) Physically prune the Gaussians using remove_return.
+      5) Return the new splats and optimizers.
+
+    The full potential loss is re-computed at the start of each iteration.
+    """
+    device = runner.splats["means"].device
+    n_gaussian_initial = runner.splats["means"].shape[0]
+    
+    if sampling_factor > 1:
+        return runner.splats, optimizers
+
+    target_n_gaussian = int(n_gaussian_initial * sampling_factor)
+    if target_n_gaussian < 1:
+        target_n_gaussian = 1  # Clamp at least 1 remains
+
+
+    # Compute overall number to remove per iteration
+    # (Total removals will be evenly distributed among iterations)
+    total_to_remove = n_gaussian_initial - target_n_gaussian
+
+    simplification_start = time.time()
+
+    pruned_gaussian_per_iteration = total_to_remove // iterations
+
+    print(f"Initial Gaussians: {n_gaussian_initial}, Target: {target_n_gaussian}, "
+          f"removing {pruned_gaussian_per_iteration} per iteration (approx).")
+
+
+    means = runner.splats["means"].detach()  # shape [n_gaussian, 3]
+    dist2_avg = (knn(means, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    dist_avg = torch.sqrt(dist2_avg.clamp(1e-6)).mean().item()
+
+    # Outer loop: each iteration recomputes the "true" potential loss.
+    for iteration in tqdm.tqdm(range(iterations)):
+        iter_start = time.time()
+        torch.cuda.synchronize()
+
+        # Update current number of Gaussians from the current splats.
+        n_gaussian = runner.splats["means"].shape[0]
+        # For this iteration, we want to keep:
+        gaussians_to_keep = n_gaussian - pruned_gaussian_per_iteration
+        # print(f"Iteration {iteration+1}: Current Gaussians: {n_gaussian}, "
+        #       f"Goal for iteration: keep {gaussians_to_keep}.")
+        
+        expected_removals = n_gaussian - gaussians_to_keep
+
+        # ---------------------------------------------------------------------------------
+        # 1) FULL FORWARD PASS TO RE-COMPUTE POTENTIAL LOSS (True Loss)
+        # ---------------------------------------------------------------------------------
+        trainloader = torch.utils.data.DataLoader(
+            trainset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=1,
+            persistent_workers=True,
+            pin_memory=True,
+        )
+        trainloader_iter = iter(trainloader)
+
+        potential_loss = torch.zeros(n_gaussian, device=device)
+        weights_count = torch.zeros(n_gaussian, device=device)
+
+        for _ in tqdm.tqdm(range(len(trainloader)), desc="Compute potential loss"):
+            # dataload_start = time.time()
+            data = next(trainloader_iter)
+
+            pixel = data["image"].to(device) / 255.0
+            camtoworlds = data["camtoworld"].to(device)
+            Ks = data["K"].to(device)
+            image_ids = data["image_id"].to(device)
+            masks = data["mask"].to(device) if "mask" in data else None
+
+            # dataload_time = time.time() - dataload_start
+# 
+            height, width = pixel.shape[1:3]
+
+            # render_start = time.time()
+
+            # Forward pass; assumed to output info with "accumulated_potential_loss"
+            _, _, info = runner.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=0,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                image_ids=image_ids,
+                render_mode="RGB+IW",
+                masks=masks,
+                gt_image=pixel
+            )
+            incr_loss = info["accumulated_potential_loss"]
+            incr_count = info["accumulated_weights_count"]
+            if incr_loss.dim() == 2:
+                incr_loss = incr_loss.sum(dim=0)
+                incr_count = incr_count.sum(dim=0)
+            pix_per_image = width * height
+            partial_loss = incr_loss
+            # partial_loss = (incr_loss / pix_per_image)
+            # if use_mean:
+                # partial_loss /= incr_count.clamp_min(1)
+            potential_loss += partial_loss 
+            weights_count += incr_count
+
+            # render_time = time.time() - render_start
+
+            # print(f"Data load time: {dataload_time:.2f} sec, Render time: {render_time:.2f} sec.")
+
+        # Normalize potential_loss so that all entries are >= 0
+        if use_mean:
+            potential_loss /= weights_count.clamp_min(1)
+
+        min_val = potential_loss.min()
+        if min_val < 0:
+            potential_loss -= min_val
+
+        # -------------------------------------------------------------------------
+        # 2) PROGRESSIVELY REMOVE GAUSSIANS (LOCAL SYNERGY UPDATE)
+        # -------------------------------------------------------------------------
+        # alive_mask tracks the Gaussians that remain.
+        alive_mask = torch.ones(n_gaussian, dtype=torch.bool, device=device)
+        # We use the current positions from runner.splats["means"].
+        means = runner.splats["means"].detach()  # shape [n_gaussian, 3]
+        opacities = torch.sigmoid(runner.splats["opacities"].detach())  # shape [n_gaussian]
+
+        # Initialize a separate synergy_update array to accumulate additive updates.
+        synergy_update = torch.zeros(n_gaussian, device=device)
+
+        n_gaussians_current = n_gaussian
+        local_iter = 0
+
+        # Create a tqdm progress bar for the removals.
+        relative_removal_chunk = min(5000, max(1, expected_removals // 500))
+
+
+        pbar = tqdm.tqdm(total=expected_removals, desc="Simplification progress")
+        while n_gaussians_current > gaussians_to_keep:
+            local_iter += 1
+
+            removal_chunk = min(relative_removal_chunk, n_gaussians_current - gaussians_to_keep)
+
+            # Compute effective potential loss used for sampling.
+            effective_loss = potential_loss * (1.0 + synergy_update)
+            alive_loss = effective_loss[alive_mask]
+            # if alive_loss.sum() < 1e-12:
+            #     print("Effective potential loss is near zero; breaking out.")
+            #     break
+
+
+                # print('alive_loss', alive_loss.min(), alive_loss.max(), alive_loss.mean(), alive_loss.std(), alive_loss.shape)
+
+            # Sample a chunk of indices (removal_chunk) among alive Gaussians.
+            # --- Conditional Sampling ---
+            if sampling:
+                # Use torch.multinomial.
+                chosen_local_idx = torch.multinomial(alive_loss, num_samples=removal_chunk, replacement=False)
+            else:
+                # Use torch.topk to choose removals deterministically (lowest effective_loss).
+                _, chosen_local_idx = torch.topk(alive_loss, k=removal_chunk, largest=False)
+
+
+            # chosen_local_idx = torch.multinomial(alive_loss, num_samples=removal_chunk, replacement=False)
+            global_alive_indices = alive_mask.nonzero(as_tuple=True)[0]
+            chosen_global_idx = global_alive_indices[chosen_local_idx]
+
+            # Vectorized synergy update:
+            removed_positions = means[chosen_global_idx]  # shape [chunk, 3]
+            removed_opacities = opacities[chosen_global_idx]  # shape [chunk]    
+            still_alive_global = alive_mask.nonzero(as_tuple=True)[0]  # shape [M]
+            alive_positions = means[still_alive_global]  # shape [M, 3]
+
+
+            M = alive_positions.shape[0]
+            chunk_size = int(1e5)  # or 1,000_000 as an integer
+                        
+            synergy_total = torch.zeros(M, device=device)  # final aggregator
+
+            # min_dists = []
+            # min_idxs  = []   # We'll store the indices in the removed_positions array
+            start = 0
+
+            while start < M:
+
+                end = min(start + chunk_size, M)
+                batch_positions = alive_positions[start:end]  # shape [batch_size, 3]
+
+                # shape [batch_size, chunk_removed, 3]
+                diff = batch_positions.unsqueeze(1) - removed_positions.unsqueeze(0)
+                dist_sq = diff.pow(2).sum(dim=2)  # shape [batch_size, chunk_removed]
+                dist = dist_sq.sqrt()            # shape [batch_size, chunk_removed]
+
+                # aggregator: sum over removed Gaussians
+                # synergy_partial[b, k] = alpha_k * exp(- dist[b, k] * distance_sigma / dist_avg)
+                # Then sum across k
+                alpha_exp = (removed_opacities * torch.exp(- dist * distance_sigma / dist_avg))  # shape [batch_size, chunk_removed]
+                batch_sum = alpha_exp.sum(dim=1)  # shape [batch_size]
+
+                synergy_total[start:end] = batch_sum
+                start = end
+
+            #     end = min(start + chunk_size, M)
+            #     batch = alive_positions[start:end]  # shape [batch_size, 3]
+
+            #     # Now compute the difference for just this batch:
+            #     diff = batch.unsqueeze(1) - removed_positions.unsqueeze(0)  # shape [batch_size, chunk, 3]
+            #     dist_sq = diff.pow(2).sum(dim=2)  # [batch_size, chunk]
+            #     batch_min_dist, batch_min_idx  = dist_sq.sqrt().min(dim=1)  # [batch_size]
+
+            #     min_dists.append(batch_min_dist)
+            #     min_idxs.append(batch_min_idx)
+            #     start = end
+
+            # # Now concatenate them into one big [M] array
+            # min_dist = torch.cat(min_dists, dim=0)   # shape [M]
+            # min_idx  = torch.cat(min_idxs, dim=0)    # shape [M]
+
+            # print('dis',min_dist.min(), min_dist.max(), min_dist.mean(), min_dist.std())
+            synergy_factor = synergy_total
+            # synergy_factor = torch.exp(-min_dist * distance_sigma / dist_avg)
+
+            # closest_opac = removed_opacities[min_idx]  # shape [M]
+            # synergy_factor *= closest_opac  # incorporate transparency
+
+            # print('syn', synergy_factor.min(), synergy_factor.max(), synergy_factor.mean(), synergy_factor.std())
+            # Exclude the ones chosen for removal:
+            # mask = ~torch.isin(still_alive_global, chosen_global_idx)
+            update_indices = still_alive_global
+            update_synergy = synergy_factor
+            # Instead of directly multiplying potential_loss, accumulate additively in synergy_update.
+            synergy_update[update_indices] += distance_alpha * update_synergy
+
+            # Mark the chosen ones as removed.
+            alive_mask[chosen_global_idx] = False
+            n_gaussians_current = alive_mask.sum().item()
+
+            pbar.update(removal_chunk)
+            pbar.set_postfix(remaining=n_gaussians_current, removed=removal_chunk)
+        pbar.close()
+
+        # -------------------------------------------------------------------------
+        # 3) PHYSICAL REMOVAL: UPDATE THE SPLATS VIA remove_return
+        # -------------------------------------------------------------------------
+        pruning_mask = ~alive_mask  # True for Gaussians to remove.
+        if keep_feats or iterations != 1:
+            splats, optimizers = remove_return(runner.splats, optimizers, runner.strategy_state, pruning_mask)
+        else:
+            splats, optimizers = create_splats_and_optimizers_from_data(
+                runner.splats["means"][alive_mask],
+                sh0_to_rgb(runner.splats["sh0"][alive_mask]),
+                runner=runner,
+                device=runner.splats["means"].device,
+                batch_size=batch_size,
+                sparse_grad=sparse_grad,
+                visible_adam=visible_adam,
+                world_size=world_size,
+                init_scale=init_scale,
+                scene_scale=scene_scale,
+                shN=runner.splats["shN"][alive_mask] if keep_feats else None,
+                scales=runner.splats["scales"][alive_mask] if keep_feats else None,
+                quats=runner.splats["quats"][alive_mask] if keep_feats else None,
+                opacities=runner.splats["opacities"][alive_mask] if keep_feats else None,
+                optimizers=optimizers,
+                keep_feats=keep_feats,
+                indices=alive_mask.nonzero(as_tuple=True)[0],
+            )
+        runner.splats = splats
+
+        n_gaussians_after = runner.splats["means"].shape[0]
+        iter_time = time.time() - iter_start
+        # print(f"Iteration {iteration+1} complete: Reduced from {n_gaussian} to {n_gaussians_after} Gaussians in {iter_time:.2f} sec.")
+
+    simplification_time = time.time() - simplification_start
+    print(f"Simplification complete, from {n_gaussian_initial} to {n_gaussians_after} Gaussians in {simplification_time:.2f} sec.")
+
+    return splats, optimizers
+
+
+
+
+'''
+
+
 
 
 

@@ -107,6 +107,7 @@ def main(base_dir, output_image, images_output_dir, errors_output_dir):
 
     print(subdirectories)
 
+
     for idx, subdir in enumerate(subdirectories):
         stats_data = get_step_psnr(subdir)
         if not stats_data:
@@ -127,6 +128,7 @@ def main(base_dir, output_image, images_output_dir, errors_output_dir):
     plt.xlabel('Step')
     plt.ylabel('PSNR')
     plt.title('Learning Curve (Step vs PSNR)')
+    plt.ylim(16, 28)
     plt.legend()
     plt.grid(True)
     
