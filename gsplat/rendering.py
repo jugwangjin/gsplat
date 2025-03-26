@@ -52,6 +52,8 @@ def rasterization(
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
     covars: Optional[Tensor] = None,
     gt_image: Optional[Tensor] = None,
+    fully_fused_projection_outputs = None,
+    isect_tiles_outputs = None, 
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -222,6 +224,7 @@ def rasterization(
         'flatten_ids', 'isect_offsets', 'width', 'height', 'tile_size'])
 
     """
+    
     meta = {}
     N = means.shape[0]
     C = viewmats.shape[0]
@@ -239,7 +242,7 @@ def rasterization(
     assert opacities.shape == (N,), opacities.shape
     assert viewmats.shape == (C, 4, 4), viewmats.shape
     assert Ks.shape == (C, 3, 3), Ks.shape
-    assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW", "F", "NS"], render_mode
+    assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW"], render_mode
 
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(
@@ -293,24 +296,30 @@ def rasterization(
         # Silently change C from local #Cameras to global #Cameras.
         C = len(viewmats)
     # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
-    proj_results = fully_fused_projection(
-        means,
-        covars,
-        quats,
-        scales,
-        viewmats,
-        Ks,
-        width,
-        height,
-        eps2d=eps2d,
-        packed=packed,
-        near_plane=near_plane,
-        far_plane=far_plane,
-        radius_clip=radius_clip,
-        sparse_grad=sparse_grad,
-        calc_compensations=(rasterize_mode == "antialiased"),
-        camera_model=camera_model,
-    )
+
+    if fully_fused_projection_outputs is not None:
+        proj_results = fully_fused_projection_outputs
+    else:
+        fully_fused_projection_outputs = fully_fused_projection(
+            means,
+            covars,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            width,
+            height,
+            eps2d=eps2d,
+            packed=packed,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            radius_clip=radius_clip,
+            sparse_grad=sparse_grad,
+            calc_compensations=(rasterize_mode == "antialiased"),
+            camera_model=camera_model,
+        )
+         
+        proj_results = fully_fused_projection_outputs
 
     if packed:
         # The results are packed into shape [nnz, ...]. All elements are valid.
@@ -330,6 +339,10 @@ def rasterization(
         opacities = opacities.repeat(C, 1)  # [C, N]
         camera_ids, gaussian_ids = None, None
 
+    # print(radii.shape, means2d.shape, depths.shape, conics.shape, opacities.shape)
+
+
+
     if compensations is not None:
         opacities = opacities * compensations
 
@@ -346,8 +359,6 @@ def rasterization(
             "opacities": opacities,
         }
     )
-
-    sh_coeffs = colors.reshape(N, -1).unsqueeze(0).repeat(C, 1, 1)  
 
     # Turn colors into [C, N, D] or [nnz, D] to pass into rasterize_to_pixels()
     if sh_degree is None:
@@ -478,22 +489,8 @@ def rasterization(
             opacities = reshape_view(C, opacities, N_world)
             colors = reshape_view(C, colors, N_world)
     # Rasterize to pixels
-    if render_mode in ["F"]:
-        # colors would be all the features of Gaussians, including colors, normals, and depths
-        rgbs = colors # shape of N, 3
-        xyzs = means.unsqueeze(0).repeat(C, 1, 1) # shape of N, 3
-        quats = quats.unsqueeze(0).repeat(C, 1, 1) # shape of N, 4
-        scales = scales.unsqueeze(0).repeat(C, 1, 1) # shape of N, 3
-        colors = torch.cat((rgbs, xyzs, quats, scales, opacities[..., None], sh_coeffs, depths[..., None]), dim=-1) # shape of N, 3+4+1+3+k*3+1, 
-
-    elif render_mode in ["NS"]:
-        rgbs = colors # shape of N, 3
-        xyzs = means.unsqueeze(0).repeat(C, 1, 1) # shape of N, 3
-        quats = quats.unsqueeze(0).repeat(C, 1, 1) # shape of N, 4
-        scales = scales.unsqueeze(0).repeat(C, 1, 1)
-        colors = torch.cat((rgbs, xyzs, quats, scales, opacities[..., None], depths[..., None]), dim=-1)
-
-    elif render_mode in ["RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW"]:
+    
+    if render_mode in ["RGB+D", "RGB+ED", "RGB+IW", "RGB+ED+IW", "RGB+D+IW"]:
         colors = torch.cat((colors, depths[..., None]), dim=-1)
         if backgrounds is not None:
             backgrounds = torch.cat(
@@ -506,10 +503,17 @@ def rasterization(
     else:  # RGB
         pass
 
+    
+
+
     # Identify intersecting tiles
     tile_width = math.ceil(width / float(tile_size))
     tile_height = math.ceil(height / float(tile_size))
-    tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
+
+    # if isect_tiles_outputs is not None:
+        # tiles_per_gauss, isect_ids, flatten_ids = isect_tiles_outputs
+    # else:
+    isect_tiles_outputs = isect_tiles(
         means2d,
         radii,
         depths,
@@ -521,14 +525,22 @@ def rasterization(
         camera_ids=camera_ids,
         gaussian_ids=gaussian_ids,
     )
-    
-    first_32_bits = isect_ids >> 32
-    isect_cam_and_tile_id = first_32_bits.int()
-    unique_isect_ids, unique_isect_counts = torch.unique(isect_cam_and_tile_id, return_counts=True)
+    tiles_per_gauss, isect_ids, flatten_ids = isect_tiles_outputs
+
+        
+    # first_32_bits = isect_ids >> 32
+    # isect_cam_and_tile_id = first_32_bits.int()
+    # unique_isect_ids, unique_isect_counts = torch.unique(isect_cam_and_tile_id, return_counts=True)
     # print(tile_width, tile_height, tiles_per_gauss, isect_ids, flatten_ids)
     # print(unique_isect_ids, unique_isect_counts.min(), unique_isect_counts.max())
     # print("rank", world_rank, "Before isect_offset_encode")
     isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
+
+    # print(tiles_per_gauss.shape, isect_ids.shape, flatten_ids.shape, isect_offsets.shape,
+    #       C, colors.shape,)
+    # print(torch.unique(tiles_per_gauss))
+
+    # print(isect_offsets)
 
     meta.update(
         {
@@ -608,7 +620,7 @@ def rasterization(
             gt_image=gt_image if gt_image is not None else None,  
         )
 
-    if render_mode in ["ED", "RGB+ED", "RGB+ED+IW", "F", "NS"]:
+    if render_mode in ["ED", "RGB+ED", "RGB+ED+IW"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(
             [
@@ -618,7 +630,7 @@ def rasterization(
             dim=-1,
         )
 
-    if render_mode in ["RGB+IW", "RGB+ED+IW", "RGB+D+IW", "F", "NS"]:
+    if render_mode in ["RGB+IW", "RGB+ED+IW", "RGB+D+IW"]:
         meta.update(
             {
                 "tile_width": tile_width,
@@ -634,7 +646,6 @@ def rasterization(
                 "max_ids": max_ids,
                 "means2d": means2d,
                 "radii": radii,
-                "rendered_sh_coeffs": sh_coeffs,
                 "depths": depths,   
                 "accumulated_weights_value": accumulated_weights_value,
                 "accumulated_weights_count": accumulated_weights_count,
@@ -642,6 +653,11 @@ def rasterization(
                 "accumulated_potential_loss": accumulated_potential_loss,
             }
         )
+
+    meta.update({
+        "fully_fused_projection_outputs": fully_fused_projection_outputs,
+        # "isect_tiles_outputs": isect_tiles_outputs,
+    })
 
     return render_colors, render_alphas, meta
 

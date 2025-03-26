@@ -344,6 +344,7 @@ class Dataset:
         patch_size: Optional[int] = None,
         load_depths: bool = False,
     ):
+        
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
@@ -440,9 +441,6 @@ class Dataset:
                 depths = depths[selector]
                 data["points"] = torch.from_numpy(points).float()
                 data["depths"] = torch.from_numpy(depths).float()
-
-            # print('loading data', index, self.parser.image_paths[index])
-
             self.loaded_data[index] = data
 
             return data 

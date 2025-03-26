@@ -209,16 +209,17 @@ def simplification(
     scene_scale: float = 1.0,
     optimizers=None,
     abs_ratio=False,
+    trainloader=None,
 ):
-    
-    trainloader = torch.utils.data.DataLoader(
-        trainset,
-        batch_size=1,
-        shuffle=True,
-        num_workers=1,
-        persistent_workers=True,
-        pin_memory=True,
-    )
+    if trainloader is None:
+        trainloader = torch.utils.data.DataLoader(
+            trainset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=0,
+            persistent_workers=True,
+            pin_memory=True,
+        )
 
     n_gaussian = runner.splats["means"].shape[0]
 
@@ -336,10 +337,147 @@ def simplification(
     return splats, optimizers
 
 
+@torch.no_grad()
+def simplification_from_mesh_simp(
+    trainset: Dataset, 
+    runner,
+    parser,
+    cfg,
+    sampling_factor: float = 0.1,
+    keep_sh0: bool = True,
+    keep_feats: bool = False,
+    batch_size: int = 1,
+    sparse_grad: bool = False,
+    visible_adam: bool = False,
+    world_size: int = 1,
+    init_scale: float = 1.0,
+    scene_scale: float = 1.0,
+    optimizers=None,
+    abs_ratio=False,
+    ascending=False,
+    use_mean=False,
+    sampling=False,
+    iterations=1,
+    apply_opacity=False,
+    trainloader=None,
+):
+    """
+    Use a mesh simplification-like strategy to prune splats based on their 
+    contribution to potential loss. This function calculates a potential loss 
+    for each splat, then removes those with the smallest contribution over 
+    multiple iterations.
+    """
+    # If no data loader is provided, create one
+    if trainloader is None:
+        trainloader = torch.utils.data.DataLoader(
+            trainset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=0,
+            persistent_workers=True,
+            pin_memory=True,
+        )
+
+    # Initial number of Gaussians and how many to remove each iteration
+    n_gaussian = runner.splats["means"].shape[0]
+    target_n_gaussian = int(n_gaussian * sampling_factor)
+    pruned_gaussian_per_iteration = max(0, (n_gaussian - target_n_gaussian) // iterations)
+
+    for iteration in range(iterations):
+        n_gaussian = runner.splats["means"].shape[0]
+        gaussians_to_keep = n_gaussian - pruned_gaussian_per_iteration
+
+        trainloader_iter = iter(trainloader)
+        accumulated_increased_losses = torch.zeros(n_gaussian, device=runner.splats["means"].device)
+        accumulated_weights_counts = torch.zeros(n_gaussian, device=runner.splats["means"].device)
+
+        for _ in tqdm.tqdm(range(len(trainloader))):
+            data = next(trainloader_iter)
+
+            pixel = data["image"].to(runner.splats["means"].device) / 255.0
+            camtoworlds = data["camtoworld"].to(runner.splats["means"].device)
+            Ks = data["K"].to(runner.splats["means"].device)
+            image_ids = data["image_id"].to(runner.splats["means"].device)
+            masks = data["mask"].to(runner.splats["means"].device) if "mask" in data else None
+            width, height = pixel.shape[1:3]
+
+            _, _, info = runner.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=0,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                image_ids=image_ids,
+                render_mode="RGB+IW",
+                masks=masks,
+                gt_image=pixel
+            )
+
+            increased_losses = info["accumulated_potential_loss"]
+            count_ = info["accumulated_weights_count"]
+            potential_loss = increased_losses.sum(dim=0) / (width * height)
+            if use_mean:
+                potential_loss /= count_.sum(dim=0).clamp(min=1)
+            accumulated_increased_losses += potential_loss
+            accumulated_weights_counts += count_.sum(dim=0)
+
+            if torch.isnan(increased_losses).any():
+                break
+
+        # Shift losses so there are no negative values
+        accumulated_increased_losses -= torch.amin(accumulated_increased_losses)
+
+        # Choose which Gaussians to keep
+        if not sampling:
+            # Sort based on accumulated loss (ascending or descending)
+            indices = torch.argsort(accumulated_increased_losses, descending=not ascending)[:gaussians_to_keep]
+        else:
+            # Randomly sample based on normalized potential loss
+            prob_mesh_simp = accumulated_increased_losses / accumulated_increased_losses.sum()
+            indices = torch.multinomial(prob_mesh_simp, gaussians_to_keep, replacement=False)
+
+        # If we want to keep further features or do multiple pruning iterations, 
+        # we directly remove splats in place. Otherwise, we create new splats.
+        if keep_feats or iterations != 1:
+            pruning_mask = torch.zeros(n_gaussian, device=runner.splats["means"].device)
+            pruning_mask[indices] = 1
+            pruning_mask = 1 - pruning_mask
+            pruning_mask = pruning_mask.bool()
+
+            # Remove splats in place
+            splats, optimizers = remove_return(runner.splats, optimizers, runner.strategy_state, pruning_mask)
+        else:
+            # Re-create splats and optimizers from the chosen indices
+            splats, optimizers = create_splats_and_optimizers_from_data(
+                runner.splats["means"][indices],
+                sh0_to_rgb(runner.splats["sh0"][indices]),
+                runner=runner,
+                device=runner.splats["means"].device,
+                batch_size=batch_size,
+                sparse_grad=sparse_grad,
+                visible_adam=visible_adam,
+                world_size=world_size,
+                init_scale=init_scale,
+                scene_scale=scene_scale,
+                shN=runner.splats["shN"][indices] if keep_feats else None,
+                scales=runner.splats["scales"][indices] if keep_feats else None,
+                quats=runner.splats["quats"][indices] if keep_feats else None,
+                opacities=runner.splats["opacities"][indices] if keep_feats else None,
+                optimizers=optimizers,
+                keep_feats=keep_feats,
+                indices=indices,
+            )
+
+        runner.splats = splats
+        print(f"Iteration {iteration} done. Reduced to {len(indices)} splats.")
+
+    return splats, optimizers
 
 
 @torch.no_grad()
-def simplification_from_mesh_simp(
+def simplification_from_mesh_simp_v2(
     trainset: Dataset, 
     runner,
     parser,
@@ -360,16 +498,18 @@ def simplification_from_mesh_simp(
     sampling = False,
     iterations = 1,
     apply_opacity = False,
+    trainloader=None,
 ):
     
-    trainloader = torch.utils.data.DataLoader(
-        trainset,
-        batch_size=1,
-        shuffle=True,
-        num_workers=1,
-        persistent_workers=True,
-        pin_memory=True,
-    )
+    if trainloader is None:
+        trainloader = torch.utils.data.DataLoader(
+            trainset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=0,
+            persistent_workers=True,
+            pin_memory=True,
+        )
 
     n_gaussian = runner.splats["means"].shape[0]
     start_n_gaussian = runner.splats["means"].shape[0]
@@ -379,6 +519,9 @@ def simplification_from_mesh_simp(
 
     pruned_gaussian_per_iteration = (n_gaussian - target_n_gaussian) // iterations
 
+
+    fully_fused_projection_outputs = {}
+    # isect_tiles_outputs = {}
 
 
     for iteration in range(iterations):
@@ -413,6 +556,9 @@ def simplification_from_mesh_simp(
 
             width, height = pixel.shape[1:3]
 
+            # assert batch size is 1
+            assert pixel.shape[0] == 1
+
             # forward
             _, _, info = runner.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -425,8 +571,13 @@ def simplification_from_mesh_simp(
                 image_ids=image_ids,
                 render_mode="RGB+IW",
                 masks=masks,
-                gt_image=pixel
+                gt_image=pixel,
+                fully_fused_projection_outputs = fully_fused_projection_outputs[image_ids[0]] if image_ids[0] in fully_fused_projection_outputs else None,
+                # isect_tiles_outputs = isect_tiles_outputs[image_ids[0]] if image_ids[0] in isect_tiles_outputs else None
             )
+
+            fully_fused_projection_outputs[image_ids[0]] = info["fully_fused_projection_outputs"]
+            # isect_tiles_outputs[image_ids[0]] = info["isect_tiles_outputs"]
 
             increased_losses = info["accumulated_potential_loss"]
             accumulated_weights_count = info["accumulated_weights_count"]
@@ -505,11 +656,36 @@ def simplification_from_mesh_simp(
                 indices=indices,
             )
         
+        for cam_id in fully_fused_projection_outputs:
+            radii, means2d, depths, conics, compensations = fully_fused_projection_outputs[cam_id]
+            radii = radii[:, indices]
+            means2d = means2d[:, indices]
+            depths = depths[:, indices]
+            conics = conics[:, indices]
+            if compensations is not None:
+                compensations = compensations[:, indices]
+
+            fully_fused_projection_outputs[cam_id] = (radii, means2d, depths, conics, compensations)
+
+            # tiles_per_gauss, isect_ids, flatten_ids = isect_tiles_outputs[cam_id]
+
+            # Create a boolean mask for elements in "indices"
+            # mask = torch.isin(flatten_ids, indices)
+
+            # Apply mask to both tensors simultaneously
+            # filtered_flatten_ids = flatten_ids[mask]
+            # filtered_isect_ids = isect_ids[mask]
+            
+            # filtered_tiles_per_gauss = tiles_per_gauss[:, indices]
+
+            # isect_tiles_outputs[cam_id] = (filtered_tiles_per_gauss, filtered_isect_ids, filtered_flatten_ids)
+
         runner.splats = splats
 
         print(f"iteration {iteration} done, reducing from {n_gaussian} to {len(indices)}, time: {time.time() - iter_start}")
 
     return splats, optimizers
+
 
 
 
@@ -542,6 +718,7 @@ def simplification_progressive(
     max_removal_iterations: int = 1000,
     chunk_size_alive: int = 1e6,
     chunk_size_removed: int = 5e1,
+    trainloader=None,
 ):
     """
     Progressive simplification of Gaussians:
@@ -604,14 +781,15 @@ def simplification_progressive(
 
         # 1) Full forward pass => potential_loss
         # Setup the DataLoader:
-        trainloader = torch.utils.data.DataLoader(
-            trainset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=1,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+        if trainloader is None:
+            trainloader = torch.utils.data.DataLoader(
+                trainset,
+                batch_size=1,
+                shuffle=True,
+                num_workers=0,
+                persistent_workers=True,
+                pin_memory=True,
+            )
         trainloader_iter = iter(trainloader)
 
         potential_loss = torch.zeros(n_gaussian, device=device)
@@ -807,6 +985,9 @@ def simplification_progressive(
 
 
 
+
+
+
 @torch.no_grad()
 def compare_simplifications(
     trainset: Dataset, 
@@ -825,17 +1006,19 @@ def compare_simplifications(
     init_scale: float = 1.0,
     scene_scale: float = 1.0,
     optimizers=None,
-    abs_ratio=False
+    abs_ratio=False,
+    trainloader=None,
 ):
-    # Get data from first method (simplification)
-    trainloader = torch.utils.data.DataLoader(
-        trainset,
-        batch_size=1,
-        shuffle=True,
-        num_workers=1,
-        persistent_workers=True,
-        pin_memory=True,
-    )
+    if trainloader is None:
+        # Get data from first method (simplification)
+        trainloader = torch.utils.data.DataLoader(
+            trainset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=0,
+            persistent_workers=True,
+            pin_memory=True,
+        )
 
     n_gaussian = runner.splats["means"].shape[0]
     device = runner.splats["means"].device
@@ -898,14 +1081,15 @@ def compare_simplifications(
 
     
     # Reset trainloader for second method
-    trainloader = torch.utils.data.DataLoader(
-        trainset,
-        batch_size=1,
-        shuffle=True,
-        num_workers=1,
-        persistent_workers=True,
-        pin_memory=True,
-    )
+    if trainloader is not None:
+        trainloader = torch.utils.data.DataLoader(
+            trainset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=0,
+            persistent_workers=True,
+            pin_memory=True,
+        )
     trainloader_iter = iter(trainloader)
     
     # Calculate accumulated increased losses for simplification_from_mesh_simp method
@@ -1025,17 +1209,19 @@ def depth_reinitialization(
         device: str = "cuda",
         init_type: str = "sfm",
         optimizers=None,
-        replace=False
+        replace=False,
+        trainloader=None,
 ):
     
-    trainloader = torch.utils.data.DataLoader(
-        trainset,
-        batch_size=1,
-        shuffle=True,
-        num_workers=1,
-        persistent_workers=True,
-        pin_memory=True,
-    )
+    if trainloader is None:
+        trainloader = torch.utils.data.DataLoader(
+            trainset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=0,
+            persistent_workers=True,
+            pin_memory=True,
+        )
 
     out_pts_list = []
     gt_list = []
