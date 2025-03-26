@@ -15,6 +15,7 @@ from gsplat.optimizers import SelectiveAdam
 
 from gsplat.strategy.ops import duplicate, remove, reset_opa, split, remove_return
 
+from torch.cuda.amp import autocast
 
 
 import time
@@ -357,7 +358,8 @@ def simplification_from_mesh_simp(
     ascending=False,
     use_mean = False,
     sampling = False,
-    iterations = 1
+    iterations = 1,
+    apply_opacity = False,
 ):
     
     trainloader = torch.utils.data.DataLoader(
@@ -429,11 +431,19 @@ def simplification_from_mesh_simp(
             increased_losses = info["accumulated_potential_loss"]
             accumulated_weights_count = info["accumulated_weights_count"]
 
-            accumulated_increased_losses += (increased_losses.sum(dim=0) / (width * height))
+            potential_loss = (increased_losses.sum(dim=0) / (width * height))
+            if use_mean:
+                potential_loss /= accumulated_weights_count.sum(dim=0).clamp(min=1)
+            accumulated_increased_losses += potential_loss
+
             accumulated_weights_counts += accumulated_weights_count.sum(dim=0)
+
 
             if torch.isnan(increased_losses).any():
                 exit()
+
+        # if use_mean:
+        #     accumulated_increased_losses /= accumulated_weights_counts.clamp(min=1)
 
         # Add fixed pruning indices: that accumulated_increased_losses < 0
         # fixed_pruning_indices = accumulated_increased_losses < 0
@@ -441,8 +451,9 @@ def simplification_from_mesh_simp(
 
         accumulated_increased_losses = accumulated_increased_losses - torch.amin(accumulated_increased_losses)  # since accumulated_increased_losses can have negative values
 
-        if use_mean:
-            accumulated_increased_losses /= accumulated_weights_counts.clamp(min=1)
+        # if apply_opacity:
+        #     opacities = torch.sigmoid(runner.splats["opacities"])
+        #     accumulated_increased_losses = accumulated_increased_losses * opacities
 
         # indices to keep
         if not sampling:
@@ -461,18 +472,9 @@ def simplification_from_mesh_simp(
 
             indices = np.random.choice(n_gaussian, n_sample, p=prob_mesh_simp, replace=False)
         
-        # remove fixed pruning indices
-        # the indices is the indices for keeping
-        # indices = [i for i in indices if i not in fixed_pruning_indices]
 
-        # indices_ = torch.argsort(accumulated_increased_losses, descending=False)[:int(n_gaussian * sampling_factor)]
-        # print("descending", torch.sigmoid(runner.splats["opacities"][indices_]).min(), torch.sigmoid(runner.splats["opacities"][indices_]).max(),\
-        #     torch.sigmoid(runner.splats["opacities"][indices_]).mean(), torch.sigmoid(runner.splats["opacities"][indices_]).std())
-        # indices_ = torch.argsort(accumulated_increased_losses, descending=True)[:int(n_gaussian * sampling_factor)]
-        # print("ascending", torch.sigmoid(runner.splats["opacities"][indices_]).min(), torch.sigmoid(runner.splats["opacities"][indices_]).max(),\
-        #     torch.sigmoid(runner.splats["opacities"][indices_]).mean(), torch.sigmoid(runner.splats["opacities"][indices_]).std())
-
-        if keep_feats:
+        
+        if keep_feats or iterations != 1:
             # simply prune the gaussians
             # pruning mask has value True where we want to prune
             pruning_mask = torch.zeros(n_gaussian, device=runner.splats["means"].device)
@@ -534,12 +536,12 @@ def simplification_progressive(
     sampling: bool = True,
     iterations: int = 1,
     # Synergy (local update) parameters:
-    distance_sigma: float = 1.0,
-    distance_alpha: float = 1.0,
+    distance_sigma: float = 2e0,
+    distance_alpha: float = 1e-1,
     removal_chunk: int = 100,  # default fallback
-    max_removal_iterations: int = 10000,
-    chunk_size_alive: int = 1e7,
-    chunk_size_removed: int = 1e3,
+    max_removal_iterations: int = 1000,
+    chunk_size_alive: int = 1e6,
+    chunk_size_removed: int = 5e1,
 ):
     """
     Progressive simplification of Gaussians:
@@ -585,6 +587,8 @@ def simplification_progressive(
     dist2_avg = (knn(means, 4)[:, 1:] ** 2).mean(dim=-1)  # shape [N]
     dist_avg = torch.sqrt(dist2_avg.clamp(1e-6)).mean().item()
     print(f"dist_avg ~ {dist_avg:.4f} (scene scale)")
+
+    exp_factor = distance_sigma / (dist_avg * dist_avg)
 
     # Timers
     simplification_start = time.time()
@@ -661,16 +665,17 @@ def simplification_progressive(
         # (B) synergy loop: remove small chunks
         alive_mask = torch.ones(n_gaussian, dtype=torch.bool, device=device)
         means = runner.splats["means"].detach()
-        opacities = torch.sigmoid(runner.splats["opacities"].detach())
+        # opacities = torch.sigmoid(runner.splats["opacities"].detach())
 
         synergy_update = torch.zeros(n_gaussian, device=device)
         n_gaussians_current = n_gaussian
 
         relative_removal_chunk = max(1, expected_removals // max_removal_iterations)
 
-        potential_loss = potential_loss.contiguous()
-        synergy_update = synergy_update.contiguous()
-        alive_mask = alive_mask.contiguous()
+        # # Ensure all tensors are contiguous
+        # potential_loss = potential_loss.contiguous()
+        # synergy_update = synergy_update.contiguous()
+        # alive_mask = alive_mask.contiguous()
 
         pbar = tqdm.tqdm(total=expected_removals, desc="Simplification progress")
 
@@ -679,31 +684,31 @@ def simplification_progressive(
             if chunk_to_remove <= 0:
                 break
 
-            # Effective potential
             effective_loss = potential_loss * (1.0 + synergy_update)
 
-            # Alive loss processing
             global_alive_indices = alive_mask.nonzero(as_tuple=True)[0]
-            global_alive_indices = global_alive_indices.sort().values
+            # global_alive_indices = global_alive_indices.sort().values
             alive_loss = effective_loss.gather(0, global_alive_indices)
 
-            # Sampling
             if sampling:
                 chosen_local_idx = torch.multinomial(alive_loss, num_samples=chunk_to_remove, replacement=False)
+                # chosen_local_idx = torch.multinomial(alive_loss - alive_loss.amin(), num_samples=chunk_to_remove, replacement=False)
             else:
                 _, chosen_local_idx = torch.topk(alive_loss, k=chunk_to_remove, largest=False)
 
-            # Determine global indices
             chosen_global_idx = global_alive_indices[chosen_local_idx]
 
             # Aggregator synergy approach
             removed_positions = means[chosen_global_idx]
-            removed_opacities = opacities[chosen_global_idx]
+            # removed_opacities = opacities[chosen_global_idx]
             alive_positions = means[global_alive_indices]
             M = alive_positions.shape[0]
 
-            synergy_total = torch.zeros(M, device=device)
 
+            # Outside the loop, create a GradScaler
+            # scaler = torch.cuda.amp.GradScaler()
+            # with autocast(dtype=torch.float16):
+            synergy_total = torch.zeros(M, device=device)
             startA = 0
             while startA < M:
                 endA = min(startA + chunk_size_alive, M)
@@ -718,25 +723,52 @@ def simplification_progressive(
                 while startR < R:
                     endR = min(startR + chunk_size_removed, R)
                     sub_removed_positions = removed_positions[startR:endR]
-                    sub_removed_opacities = removed_opacities[startR:endR]
+                    # sub_removed_opacities = removed_opacities[startR:endR]
 
-                    dist = torch.cdist(batch_positions, sub_removed_positions, p=2)
-                    alpha_exp = sub_removed_opacities * torch.exp(-dist * distance_sigma / dist_avg)
-                    synergy_sub += alpha_exp.sum(dim=1)
+                    # dist = torch.cdist(batch_positions, sub_removed_positions, p=2)
+                    # Replace cdist with squared norm calculation
+
+                    diff = batch_positions.unsqueeze(1) - sub_removed_positions.unsqueeze(0)
+                    dist_sq = (diff * diff).sum(dim=2)  # Avoid sqrt until needed
+                    # dist = dist_sq.sqrt()  # Only if absolutely required
+                
+                    factor = 1 / (exp_factor * dist_sq + 1)
+                    # alpha_exp = sub_removed_opacities / (exp_factor * dist_sq + 1)
+                    # torch.exp(exp_factor * dist)
+                    # alpha_exp = sub_removed_opacities * torch.exp(exp_factor * dist)
+                    
+                    # synergy_sub += alpha_exp.sum(dim=1)
+                    # print(factor.sum(dim=1).amin(), factor.sum(dim=1).amax())
+                    synergy_sub.add_(factor.sum(dim=1))
 
                     startR = endR
 
                 synergy_total[startA:endA] = synergy_sub
                 startA = endA
 
+            # # If this is part of a larger training loop, use the scaler
+            # scaler.scale(loss).backward()
+            # scaler.step(optimizer)
+            # scaler.update()
+
             # Update synergy and remove Gaussians
-            synergy_update[global_alive_indices] += distance_alpha * synergy_total
-            alive_mask.scatter_(0, chosen_global_idx, False)
+            synergy_update[global_alive_indices] += distance_alpha * synergy_total.float()
+
+            # Remove Gaussians
+            alive_mask[chosen_global_idx] = False
+
+            # Update number of Gaussians
             n_gaussians_current -= chunk_to_remove
             pbar.update(chunk_to_remove)
-            pbar.set_postfix(remaining=n_gaussians_current, removed=chunk_to_remove)
+            pbar.set_postfix(removed=chunk_to_remove, syn_min=synergy_update.min().item(), syn_max=synergy_update.max().item(), syn_mean=synergy_update.mean().item())
+
+            # Timing for the block
+            n_gaussians_sum = n_gaussians_current
+
+            torch.cuda.empty_cache()
 
         pbar.close()
+
 
 
 

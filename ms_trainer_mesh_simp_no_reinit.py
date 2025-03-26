@@ -76,6 +76,7 @@ class Config:
     designated_sampling_factors: Optional[List[float]] = None
 
     ascending: bool = False
+    apply_opacity: bool = False
     use_mean: bool = False
     sampling: bool = False
     simplification_iterations: int = 1
@@ -705,7 +706,8 @@ class Runner(BaseRunner):
                         scene_scale=self.scene_scale,
                         optimizers=self.optimizers,
                         ascending=cfg.ascending,
-                        use_mean=cfg.use_mean
+                        use_mean=cfg.use_mean,
+                        apply_opacity=cfg.apply_opacity,
                     )
                     
                     print("Number of Gaussians before simplification: ", n_gaussians)
@@ -736,7 +738,7 @@ class Runner(BaseRunner):
                         cfg = self.cfg,
                         sampling_factor = sampling_factor,
                         keep_sh0 = True,
-                        keep_feats = True,
+                        keep_feats = False,
                         batch_size=cfg.batch_size,
                         sparse_grad=cfg.sparse_grad,
                         visible_adam=cfg.visible_adam,
@@ -747,7 +749,9 @@ class Runner(BaseRunner):
                         ascending=cfg.ascending,
                         use_mean=cfg.use_mean,
                         sampling=cfg.sampling,
-                        iterations=cfg.simplification_iterations
+                        iterations=1,
+                        # iterations=cfg.simplification_iterations,
+                        apply_opacity=cfg.apply_opacity,
                     )
                     
                     print("Number of Gaussians before simplification: ", n_gaussians)
@@ -794,7 +798,8 @@ class Runner(BaseRunner):
                         ascending=cfg.ascending,
                         use_mean=cfg.use_mean,
                         sampling=cfg.sampling,
-                        iterations=cfg.simplification_iterations
+                        iterations=cfg.simplification_iterations,
+                        apply_opacity=cfg.apply_opacity,
                     )
                     
                     print("Number of Gaussians before simplification: ", n_gaussians)

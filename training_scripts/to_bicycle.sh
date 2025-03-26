@@ -1,0 +1,19 @@
+# CUDA_VISIBLE_DEVICES=2 python ms_trainer_mesh_simp_no_reinit.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/garden/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/simplification_comparison/garden_inc_mesh_simp_samp_iter_10_no_reinit_simp_10_times --eval_steps 14900 15001 16001 17001 18001 19001 19999 20001 21001 22001 23001 24001 25001 26001 27001 28001 29001 30000 --sampling --simplification_iterations 10 --target_num_gaussians 500000 --simplification_num 3
+
+CUDA_VISIBLE_DEVICES=2 python ms_trainer_mesh_simp_no_reinit.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/garden/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/simplification_comparison/garden_mesh_simp_samp_3_iter_10_opa_rast --eval_steps 14900 15001 16001 17001 18001 19001 19999 20001 21001 22001 23001 24001 25001 26001 27001 28001 29001 30000 --sampling --simplification_iterations 10 --target_num_gaussians 500000 --simplification_num 3 
+
+CUDA_VISIBLE_DEVICES=2 python ms_trainer_mesh_simp_no_reinit.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/garden/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/simplification_comparison/garden_mesh_simp_samp_3_iter_10_opa_mean --eval_steps 14900 15001 16001 17001 18001 19001 19999 20001 21001 22001 23001 24001 25001 26001 27001 28001 29001 30000 --sampling --simplification_iterations 10 --target_num_gaussians 500000 --simplification_num 3 --use_mean 
+
+CUDA_VISIBLE_DEVICES=2 python ms_trainer_mesh_simp_no_reinit.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/simplification_comparison_bicycle/bicycle_mesh_simp_samp_3_iter_10_mean --eval_steps 14900 15001 16001 17001 18001 19001 19999 20001 21001 22001 23001 24001 25001 26001 27001 28001 29001 30000 --sampling --simplification_iterations 10 --target_num_gaussians 500000 --simplification_num 3 --use_mean  
+
+CUDA_VISIBLE_DEVICES=2 python ms_trainer_mesh_simp_no_reinit.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/simplification_comparison_bicycle/bicycle_mesh_simp_samp_3_iter_10 --eval_steps 14900 15001 16001 17001 18001 19001 19999 20001 21001 22001 23001 24001 25001 26001 27001 28001 29001 30000 --sampling --simplification_iterations 10 --target_num_gaussians 500000 --simplification_num 3 
+
+
+CUDA_VISIBLE_DEVICES=3 python ms_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/simplification_comparison_bicycle/bicycle_ms --eval_steps 14900 15001 16001 17001 18001 19001 19999 20001 21001 22001 23001 24001 25001 26001 27001 28001 29001 30000   &
+
+CUDA_VISIBLE_DEVICES=2 python ms_d_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/simplification_comparison_bicycle/bicycle_dense --eval_steps 14900 15001 16001 17001 18001 19001 19999 20001 21001 22001 23001 24001 25001 26001 27001 28001 29001 30000  
+
+
+CUDA_VISIBLE_DEVICES=2 python ms_trainer_mesh_simp_no_reinit.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/garden/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/simplification_comparison/garden_mesh_simp_samp_3_iter_10_opa_rast_250k --eval_steps 14900 15001 16001 17001 18001 19001 19999 20001 21001 22001 23001 24001 25001 26001 27001 28001 29001 30000 --sampling --simplification_iterations 10 --target_num_gaussians 250000 --simplification_num 3 &
+
+CUDA_VISIBLE_DEVICES=3 python ms_trainer.py msd --data_dir /Bean/data/gwangjin/2025/kdgs/360_v2/bicycle/ --data_factor 4 --result_dir /Bean/log/gwangjin/2025/kdgs/simplification_comparison_bicycle/bicycle_ms --eval_steps 14900 15001 16001 17001 18001 19001 19999 20001 21001 22001 23001 24001 25001 26001 27001 28001 29001 30000 --sampling_factor 0.25 &

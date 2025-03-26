@@ -103,7 +103,7 @@ def main(base_dir, output_image, images_output_dir, errors_output_dir):
     for d in subdirectories:
         print(d, not 'iter10' in d, not d.endswith('25'))
 
-    subdirectories = [d for d in subdirectories if (not 'iter10' in d) and not d.endswith('25') and not d.endswith('06') and not d.endswith('reinit') and not d.endswith('no_reinit_2')]
+    subdirectories = [d for d in subdirectories if (not 'iter10' in d) and not d.endswith('25') and not d.endswith('06') and not d.endswith('reinit') and not d.endswith('no_reinit_2') and not 'prog' in os.path.basename(d)]
 
     print(subdirectories)
 

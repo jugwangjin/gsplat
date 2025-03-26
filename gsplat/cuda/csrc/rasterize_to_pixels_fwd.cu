@@ -312,6 +312,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                     potential_loss[k] = expected_color[k] - gt_image[pix_id * 3 + k];
                     potential_loss[k] = potential_loss[k] >= 0 ? potential_loss[k] : -potential_loss[k];
                     expected_loss_inc = potential_loss[k] - cur_color_loss[k];
+                    expected_loss_inc = expected_loss_inc * vis;
                     atomicAdd(&accumulated_potential_loss[g], expected_loss_inc);
                     // atomicAdd(&accumulated_potential_loss[g], potential_loss[k]);
                     

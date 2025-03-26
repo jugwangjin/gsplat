@@ -28,7 +28,7 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from fused_ssim import fused_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, visualize_id_maps, depth_reinitialization, simplification, simplification_progressive
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, visualize_id_maps, depth_reinitialization, simplification, simplification_progressive, compare_simplifications
 from lib_bilagrid import (
     BilateralGrid,
     slice,
@@ -737,7 +737,8 @@ class Runner(BaseRunner):
                         cfg = self.cfg,
                         sampling_factor = sampling_factor,
                         keep_sh0 = True,
-                        keep_feats = False,
+                        # keep_feats = False,
+                        keep_feats = True,
                         batch_size=cfg.batch_size,
                         sparse_grad=cfg.sparse_grad,
                         visible_adam=cfg.visible_adam,
@@ -748,8 +749,8 @@ class Runner(BaseRunner):
                         ascending=cfg.ascending,
                         use_mean=cfg.use_mean,
                         sampling=cfg.sampling,
-                        iterations=1
-                        # iterations=cfg.simplification_iterations
+                        # iterations=1
+                        iterations=cfg.simplification_iterations
                     )
                     
                     print("Number of Gaussians before simplification: ", n_gaussians)
@@ -766,7 +767,6 @@ class Runner(BaseRunner):
                         self.strategy_state = self.cfg.strategy.initialize_state()
                     else:
                         assert_never(self.cfg.strategy)
-                
 
                 # simplifications
                 

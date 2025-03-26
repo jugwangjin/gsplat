@@ -1080,13 +1080,13 @@ class Runner:
                     f"{self.error_dir}/{stage}_step{step}_{i:04d}_error.png",
                     error_map_np,
                 )
-                # alpha map 
-                alpha_map = alphas.squeeze(0).squeeze(-1).cpu().numpy()
-                alpha_map = (alpha_map * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.alpha_dir}/{stage}_step{step}_{i:04d}_alpha.png",
-                    alpha_map,
-                )
+                # # alpha map 
+                # alpha_map = alphas.squeeze(0).squeeze(-1).cpu().numpy()
+                # alpha_map = (alpha_map * 255).astype(np.uint8)
+                # imageio.imwrite(
+                #     f"{self.alpha_dir}/{stage}_step{step}_{i:04d}_alpha.png",
+                #     alpha_map,
+                # )
                 
                 
                 # print(f"{self.render_dir}/{stage}_step{step}_{i:04d}.png")
