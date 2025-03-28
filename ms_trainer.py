@@ -1056,6 +1056,7 @@ class Runner:
                 far_plane=cfg.far_plane,
                 masks=masks,
                 render_mode=render_mode,
+                gt_image=pixels
             )  # [1, H, W, 3]
             ellipse_time += time.time() - tic
 

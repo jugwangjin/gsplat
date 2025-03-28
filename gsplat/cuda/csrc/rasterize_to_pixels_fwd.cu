@@ -231,14 +231,15 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
     if (inside && gt_image != nullptr){
         // Only cover 3D (RGB) gt_image, no matter how many dimensions the rendered images or gt_image have. 
-        
         // Accumulate again, computing the potential error when we omit each gaussian
 
         S cur_color_loss[3] = {0.0f};
         // calculate L1 loss (abs) for each channel between pix_out and gt_image
         for (uint32_t k = 0; k < 3; ++k) {
             S diff = pix_out[k] - gt_image[pix_id * 3 + k];
-            cur_color_loss[k] = diff >= 0 ? diff : -diff;
+            cur_color_loss[k] = diff;
+            // pix_out[k] = gt_image[pix_id * 3 + k];
+        // cur_color_loss[k] = diff >= 0 ? diff : -diff;
         }
 
         S cur_color[COLOR_DIM] = {0.0f};

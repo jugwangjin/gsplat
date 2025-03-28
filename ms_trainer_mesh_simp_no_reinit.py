@@ -738,8 +738,8 @@ class Runner(BaseRunner):
                         cfg = self.cfg,
                         sampling_factor = sampling_factor,
                         keep_sh0 = True,
-                        keep_feats = True,
-                        # keep_feats = False,
+                        # keep_feats = True,
+                        keep_feats = False,
                         batch_size=cfg.batch_size,
                         sparse_grad=cfg.sparse_grad,
                         visible_adam=cfg.visible_adam,
@@ -750,8 +750,8 @@ class Runner(BaseRunner):
                         ascending=cfg.ascending,
                         use_mean=cfg.use_mean,
                         sampling=cfg.sampling,
-                        # iterations=1,
-                        iterations=cfg.simplification_iterations,
+                        iterations=1,
+                        # iterations=cfg.simplification_iterations,
                         apply_opacity=cfg.apply_opacity,
                         trainloader=trainloader
                     )
