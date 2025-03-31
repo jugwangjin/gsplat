@@ -567,7 +567,7 @@ class Runner:
             self.trainset,
             batch_size=cfg.batch_size,
             shuffle=True,
-            num_workers=0,
+            num_workers=1,
             persistent_workers=True,
             pin_memory=True,
         )
@@ -1023,7 +1023,7 @@ class Runner:
         world_size = self.world_size
 
         valloader = torch.utils.data.DataLoader(
-            self.valset, batch_size=1, shuffle=False, num_workers=0
+            self.valset, batch_size=1, shuffle=False, num_workers=1
         )
 
         ellipse_time = 0

@@ -70,7 +70,7 @@ fix_all_seeds(20202464)
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # Name of compression strategy to use

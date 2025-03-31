@@ -74,7 +74,7 @@ fix_all_seeds(20202464)
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     use_novel_view: bool = False
     teacher_ckpt: str = None
     # The teacher's sampling ratio. If 0.1, the 10% of the teacher's GSs are used for the student.

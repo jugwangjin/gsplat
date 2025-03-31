@@ -46,7 +46,6 @@ def copy_render_images(subdir, stats_data, images_output_dir, errors_output_dir)
     if not os.path.isdir(renders_dir):
         return
 
-
     # Get a label from the subdirectory name.
     method_label = os.path.basename(subdir)
     
@@ -79,70 +78,118 @@ def copy_render_images(subdir, stats_data, images_output_dir, errors_output_dir)
                 except Exception as e:
                     print(f"Error copying {error_filepath} to {dst_filepath}: {e}")
 
-def main(base_dir, output_image, images_output_dir, errors_output_dir):
+def read_num_gaussians(result_dir: str) -> int:
+    """Read number of gaussians from val_step29999.json"""
+    json_path = os.path.join(result_dir, 'stats', 'val_step29999.json')
+    try:
+        with open(json_path, 'r') as f:
+            stats = json.load(f)
+            return stats['num_GS']
+    except Exception as e:
+        print(f"Error reading {json_path}: {e}")
+        return None
+
+def plot_learning_curve(dataset, base_dir, output_dir):
     """
-    For a given base directory, this function finds all subdirectories,
-    collects the (step, psnr) data from each subdirectory's 'stats' folder,
-    plots a learning curve (step vs. PSNR) for each method, and copies the 
-    corresponding rendered images (for index 0 and 10) to a flat output directory.
+    Plot learning curve for a specific dataset
     """
     plt.figure(figsize=(10, 6))
     
-    # Create the images output directory if it doesn't exist.
+    # Create output directories
+    images_output_dir = os.path.join(output_dir, dataset, 'images')
+    errors_output_dir = os.path.join(output_dir, dataset, 'errors')
     os.makedirs(images_output_dir, exist_ok=True)
     os.makedirs(errors_output_dir, exist_ok=True)
     
-    
-
-    # List all subdirectories in the base directory.
+    # Find all subdirectories for this dataset
     subdirectories = [os.path.join(base_dir, d) 
-                      for d in os.listdir(base_dir) 
-                      if os.path.isdir(os.path.join(base_dir, d))]
-    print(subdirectories)
-
-    for d in subdirectories:
-        print(d, not 'iter10' in d, not d.endswith('25'))
-
-    subdirectories = [d for d in subdirectories if (not 'iter10' in d) and not d.endswith('25') and not d.endswith('06') and not d.endswith('reinit') and not d.endswith('no_reinit_2') and not 'prog' in os.path.basename(d)]
-
-    print(subdirectories)
-
+                     for d in os.listdir(base_dir) 
+                     if os.path.isdir(os.path.join(base_dir, d)) and dataset in d]
+    
+    # Filter out unwanted directories
+    subdirectories = [d for d in subdirectories 
+                     if (not 'iter10' in d) 
+                     and not d.endswith('25') 
+                     and not d.endswith('06') 
+                     and not d.endswith('reinit') 
+                     and not d.endswith('no_reinit_2') 
+                     and not 'prog' in os.path.basename(d)]
+    
+    print(f"\nProcessing {dataset}...")
+    print(f"Found subdirectories: {subdirectories}")
 
     for idx, subdir in enumerate(subdirectories):
         stats_data = get_step_psnr(subdir)
         if not stats_data:
-            continue  # Skip if no stats data was found.
+            continue
         
-        # Plot the learning curve for this method with enhanced styling.
+        # Plot the learning curve
         steps, psnrs = zip(*stats_data)
-        label = os.path.basename(subdir)
-        # Cycle through colors using the tab10 colormap.
+        base_label = os.path.basename(subdir)
+        
+        # 가우시안 수 추출
+        num_gaussians = read_num_gaussians(subdir)
+        if num_gaussians is None:
+            num_gaussians = 500000  # 기본값
+        gaussian_count = num_gaussians / 1_000_000  # 백만 단위로 변환
+        
+        # 최종 PSNR 값 추출
+        final_psnr = psnrs[-1]
+        
+        label = f"{base_label} ({gaussian_count:.2f}M, PSNR: {final_psnr:.2f})"
         color = plt.cm.tab10(idx % 10)
         plt.plot(steps, psnrs, label=label, color=color, alpha=0.6, linewidth=1.0, marker='x', markersize=4)
         
         if not args.copy_images:
             continue
-        # Copy the rendered images corresponding to index 0 and 10 for each valid step.
         copy_render_images(subdir, stats_data, images_output_dir, errors_output_dir)
     
     plt.xlabel('Step')
     plt.ylabel('PSNR')
-    plt.title('Learning Curve (Step vs PSNR)')
+    plt.title(f'Learning Curve for {dataset} (Step vs PSNR)')
     plt.ylim(18)
     plt.legend()
     plt.grid(True)
     
-    # Save the plot to a file.
+    # Save the plot
+    output_image = os.path.join(output_dir, f'{dataset}_learning_curve.png')
     plt.savefig(output_image)
+    plt.close()
     print(f"Plot saved to {output_image}")
 
+def main():
+    # 데이터셋 목록
+    datasets = [
+        "bonsai",
+        "bicycle",
+        "counter",
+        "flowers",
+        "garden",
+        "kitchen",
+        "room",
+        "stump",
+        "treehill"
+    ]
+    
+    base_dir = args.base_dir
+    output_dir = args.output_dir
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Process each dataset
+    for dataset in datasets:
+        plot_learning_curve(dataset, base_dir, output_dir)
+        print(f"\nCompleted processing {dataset}")
+        print("-" * 40)
+    
+    print("\nAll datasets processed!")
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Plot learning curves (step vs PSNR) from json stats and copy select rendered images.")
+    parser = argparse.ArgumentParser(description="Plot learning curves for each dataset from json stats and copy select rendered images.")
     parser.add_argument("--base-dir", required=True, help="Base directory containing subdirectories with stats and renders folders.")
-    parser.add_argument("--output", default='learning_curve.png', help="Output image file name for the learning curve plot (e.g., plot.png)")
+    parser.add_argument("--output-dir", required=True, help="Output directory for plots and images.")
     parser.add_argument("--copy_images", action='store_true', help="Copy the selected rendered images to the output directory.")
-    parser.add_argument("--images-output-dir", default='learning_curve', help="Output directory to copy the selected rendered images.")
-    parser.add_argument("--errors-output-dir", default='learning_curve_errors', help="Output directory to copy the selected rendered images.")
     args = parser.parse_args()
     
-    main(args.base_dir, args.output, args.images_output_dir, args.errors_output_dir)
+    main() 

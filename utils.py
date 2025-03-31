@@ -211,15 +211,15 @@ def simplification(
     abs_ratio=False,
     trainloader=None,
 ):
-    if trainloader is None:
-        trainloader = torch.utils.data.DataLoader(
-            trainset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=0,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+    # if trainloader is None:
+    trainloader = torch.utils.data.DataLoader(
+        trainset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=1,
+        persistent_workers=True,
+        pin_memory=True,
+    )
 
     n_gaussian = runner.splats["means"].shape[0]
 
@@ -368,15 +368,15 @@ def simplification_from_mesh_simp(
     multiple iterations.
     """
     # If no data loader is provided, create one
-    if trainloader is None:
-        trainloader = torch.utils.data.DataLoader(
-            trainset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=0,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+    # if trainloader is None:
+    trainloader = torch.utils.data.DataLoader(
+        trainset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=1,
+        persistent_workers=True,
+        pin_memory=True,
+    )
 
     # Initial number of Gaussians and how many to remove each iteration
     n_gaussian = runner.splats["means"].shape[0]
@@ -426,8 +426,8 @@ def simplification_from_mesh_simp(
             if torch.isnan(increased_losses).any():
                 break
 
-        # Shift losses so there are no negative values
-        accumulated_increased_losses -= torch.amin(accumulated_increased_losses)
+        # # Shift losses so there are no negative values
+        # accumulated_increased_losses -= torch.amin(accumulated_increased_losses)
 
         # Choose which Gaussians to keep
         if not sampling:
@@ -435,8 +435,8 @@ def simplification_from_mesh_simp(
             indices = torch.argsort(accumulated_increased_losses, descending=not ascending)[:gaussians_to_keep]
         else:
             # Randomly sample based on normalized potential loss
-            prob_mesh_simp = accumulated_increased_losses / accumulated_increased_losses.sum()
-            indices = torch.multinomial(prob_mesh_simp, gaussians_to_keep, replacement=False)
+            # prob_mesh_simp = accumulated_increased_losses / accumulated_increased_losses.sum()
+            indices = torch.multinomial(accumulated_increased_losses, gaussians_to_keep, replacement=False)
 
         # If we want to keep further features or do multiple pruning iterations, 
         # we directly remove splats in place. Otherwise, we create new splats.
@@ -477,7 +477,7 @@ def simplification_from_mesh_simp(
 
 
 @torch.no_grad()
-def simplification_from_mesh_simp_v2(
+def simplification_with_approx(
     trainset: Dataset, 
     runner,
     parser,
@@ -494,72 +494,103 @@ def simplification_from_mesh_simp_v2(
     optimizers=None,
     abs_ratio=False,
     ascending=False,
-    use_mean = False,
-    sampling = False,
-    iterations = 1,
-    apply_opacity = False,
+    use_mean=False,
+    sampling=False,
+    iterations=1,
+    apply_opacity=False,
+    distance_sigma: float = 2e0,
+    distance_alpha: float = 1e-1,
+    removal_chunk: int = 10,
+    max_removal_iterations: int = 1000,
+    chunk_size_alive: int = 1e6,
+    chunk_size_removed: int = 5e1,
     trainloader=None,
 ):
+    """가우시안 단순화를 수행하는 함수 (progressive 방식 + 정확도 향상)
     
+    Args:
+        trainset: 학습 데이터셋
+        runner: 학습 러너
+        parser: 파서
+        cfg: 설정
+        sampling_factor: 샘플링 비율
+        keep_sh0: sh0 유지 여부
+        keep_feats: 특징 유지 여부 (True: 점진적 제거, False: 한번에 제거)
+        batch_size: 배치 크기
+        sparse_grad: 희소 그래디언트 사용 여부
+        visible_adam: visible adam 사용 여부
+        world_size: 세계 크기
+        init_scale: 초기 스케일
+        scene_scale: 장면 스케일
+        optimizers: 옵티마이저
+        abs_ratio: 절대 비율 사용 여부
+        ascending: 오름차순 정렬 여부
+        use_mean: 평균 사용 여부
+        sampling: 샘플링 사용 여부 (True: 확률 기반 샘플링, False: 손실 기반 선택)
+        iterations: 반복 횟수
+        apply_opacity: 투명도 적용 여부
+        distance_sigma: 거리 시그마
+        distance_alpha: 거리 알파
+        removal_chunk: 제거 청크 크기
+        max_removal_iterations: 최대 제거 반복 횟수
+        chunk_size_alive: 생존 청크 크기
+        chunk_size_removed: 제거된 청크 크기
+        trainloader: 학습 데이터로더
+    """
+    device = runner.splats["means"].device
+    n_gaussians = runner.splats["means"].shape[0]
+    gaussians_to_keep = int(n_gaussians * sampling_factor)
+    gaussians_to_remove = n_gaussians - gaussians_to_keep
+
     if trainloader is None:
         trainloader = torch.utils.data.DataLoader(
             trainset,
             batch_size=1,
-            shuffle=True,
-            num_workers=0,
+            shuffle=False,
+            num_workers=1,
             persistent_workers=True,
             pin_memory=True,
         )
 
-    n_gaussian = runner.splats["means"].shape[0]
-    start_n_gaussian = runner.splats["means"].shape[0]
+    num_camera = len(trainloader)
 
-    target_n_gaussian = int(n_gaussian * sampling_factor)
+    # Progressive removal loop
+    for it_iter in range(iterations):
+        print(f"Simplification iteration {it_iter + 1}/{iterations}")
+        
+        current_gaussians_to_remove = gaussians_to_remove // iterations 
 
+        n_gaussians = runner.splats["means"].shape[0]
 
-    pruned_gaussian_per_iteration = (n_gaussian - target_n_gaussian) // iterations
-
-
-    fully_fused_projection_outputs = {}
-    # isect_tiles_outputs = {}
-
-
-    for iteration in range(iterations):
-        iter_start = time.time()
-        torch.cuda.synchronize()
-
-        n_gaussian = runner.splats["means"].shape[0]
-        # remaining_iterations = iterations - iteration
-        # tmp_sampling_factor = target_n_gaussian / n_gaussian
-        # current_sampling_factor = math.pow(tmp_sampling_factor, 1.0 / remaining_iterations)
-
-        # print("Start Gaussians: ", n_gaussian, " current gaussians: ", n_gaussian, " target gaussians: ", target_n_gaussian, " current sampling factor: ", current_sampling_factor, " remaining iterations: ", remaining_iterations)
-
-        gaussians_to_keep = n_gaussian - pruned_gaussian_per_iteration
-
-        # importance_scores = torch.zeros(n_gaussian, device=runner.splats["means"].device)
-        # pixels_per_gaussian = torch.zeros(n_gaussian, device=runner.splats["means"].device, dtype=torch.int)
+        # Initialize accumulated values
+        accumulated_gt_colors = torch.zeros(n_gaussians, 3, device=device)
+        accumulated_final_colors = torch.zeros(n_gaussians, 3, device=device)
+        accumulated_cur_colors = torch.zeros(n_gaussians, 3, device=device)
+        accumulated_one_minus_alphas = torch.zeros(n_gaussians, device=device)
+        accumulated_colors = torch.zeros(n_gaussians, 3, device=device)
+        accumulated_weights_count = torch.zeros(n_gaussians, device=device)
+        radiis = torch.zeros(len(trainloader), n_gaussians, device=device)
+        conics = torch.zeros(len(trainloader), n_gaussians, 3, device=device)
+        means2ds = torch.zeros(len(trainloader), n_gaussians, 2, device=device)
+        valid_radiis = torch.zeros(len(trainloader), n_gaussians, device=device)
 
         trainloader_iter = iter(trainloader)
 
-        accumulated_increased_losses = torch.zeros(n_gaussian, device=runner.splats["means"].device)
-        accumulated_weights_counts = torch.zeros(n_gaussian, device=runner.splats["means"].device)
+        # potential_loss = torch.zeros(n_gaussian, device=device)
+        # weights_count = torch.zeros(n_gaussian, device=device)
 
-        for _ in tqdm.tqdm(range(len(trainloader))):
+        # Full pass: accumulate potential_loss
+        for batch_idx in tqdm.tqdm(range(len(trainloader)), desc="Compute potential loss"):
             data = next(trainloader_iter)
 
-            pixel = data["image"].to(runner.splats["means"].device) / 255.0
-            camtoworlds = camtoworlds_gt = data["camtoworld"].to(runner.splats["means"].device)
-            Ks = data["K"].to(runner.splats["means"].device)
-            image_ids = data["image_id"].to(runner.splats["means"].device)
-            masks = data["mask"].to(runner.splats["means"].device) if "mask" in data else None
+            pixel = data["image"].to(device) / 255.0
+            camtoworlds = data["camtoworld"].to(device)
+            Ks = data["K"].to(device)
+            image_ids = data["image_id"].to(device)
+            masks = data["mask"].to(device) if "mask" in data else None
 
-            width, height = pixel.shape[1:3]
-
-            # assert batch size is 1
-            assert pixel.shape[0] == 1
-
-            # forward
+            height, width = pixel.shape[1:3]
+            # Render with current parameters
             _, _, info = runner.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -572,123 +603,143 @@ def simplification_from_mesh_simp_v2(
                 render_mode="RGB+IW",
                 masks=masks,
                 gt_image=pixel,
-                fully_fused_projection_outputs = fully_fused_projection_outputs[image_ids[0]] if image_ids[0] in fully_fused_projection_outputs else None,
-                # isect_tiles_outputs = isect_tiles_outputs[image_ids[0]] if image_ids[0] in isect_tiles_outputs else None
+                use_approx=True,
             )
 
-            fully_fused_projection_outputs[image_ids[0]] = info["fully_fused_projection_outputs"]
-            # isect_tiles_outputs[image_ids[0]] = info["isect_tiles_outputs"]
+            # Accumulate values
+            gt_colors = info["accumulated_gt_colors"].sum(dim=0)
+            final_colors = info["accumulated_final_colors"].sum(dim=0)
+            cur_colors = info["accumulated_cur_colors"].sum(dim=0)
+            one_minus_alphas = info["accumulated_one_minus_alphas"].sum(dim=0)
+            colors = info["accumulated_colors"].sum(dim=0)
+            weights_count = info["accumulated_weights_count"].sum(dim=0)
 
-            increased_losses = info["accumulated_potential_loss"]
-            accumulated_weights_count = info["accumulated_weights_count"]
+            accumulated_gt_colors += gt_colors
+            accumulated_final_colors += final_colors
+            accumulated_cur_colors += cur_colors
+            accumulated_one_minus_alphas += one_minus_alphas
+            accumulated_colors += colors
+            accumulated_weights_count += weights_count
 
-            potential_loss = (increased_losses.sum(dim=0) / (width * height))
-            if use_mean:
-                potential_loss /= accumulated_weights_count.sum(dim=0).clamp(min=1)
-            accumulated_increased_losses += potential_loss
-
-            accumulated_weights_counts += accumulated_weights_count.sum(dim=0)
+            radiis[batch_idx] = info["radii"][0]
+            conics[batch_idx] = info["conics"][0]
+            means2ds[batch_idx] = info["means2d"][0]
+            valid_radiis[batch_idx] = info["radii"][0] > 0
 
 
-            if torch.isnan(increased_losses).any():
-                exit()
+        accumulated_weights_count = accumulated_weights_count.clamp(min=1)
 
-        # if use_mean:
-        #     accumulated_increased_losses /= accumulated_weights_counts.clamp(min=1)
 
-        # Add fixed pruning indices: that accumulated_increased_losses < 0
-        # fixed_pruning_indices = accumulated_increased_losses < 0
-        # fixed_pruning_indices = torch.nonzero(fixed_pruning_indices, as_tuple=True)[0]
+        accumulated_gt_colors = accumulated_gt_colors / accumulated_weights_count.unsqueeze(-1)
+        accumulated_final_colors = accumulated_final_colors / accumulated_weights_count.unsqueeze(-1)
+        accumulated_cur_colors = accumulated_cur_colors / accumulated_weights_count.unsqueeze(-1)
+        accumulated_one_minus_alphas = accumulated_one_minus_alphas / accumulated_weights_count
+        accumulated_colors = accumulated_colors / accumulated_weights_count.unsqueeze(-1)
 
-        accumulated_increased_losses = accumulated_increased_losses - torch.amin(accumulated_increased_losses)  # since accumulated_increased_losses can have negative values
+        # Initialize alive mask
+        alive_mask = torch.ones(n_gaussians, dtype=torch.bool, device=device)
+        n_alive = n_gaussians
 
-        # if apply_opacity:
-        #     opacities = torch.sigmoid(runner.splats["opacities"])
-        #     accumulated_increased_losses = accumulated_increased_losses * opacities
+        current_target_gaussians = n_alive - current_gaussians_to_remove
 
-        # indices to keep
-        if not sampling:
-            indices = torch.argsort(accumulated_increased_losses, descending=False if ascending else True)[:int(gaussians_to_keep)]
-            # indices = torch.argsort(accumulated_increased_losses, descending=False if ascending else True)[:int(n_gaussian * current_sampling_factor)]
-            
-        else:
-            # same as simplification - making prob 
-            # inverse_losses = 1.0 / (accumulated_increased_losses + 1e-10)  # Add small epsilon to avoid division by zero
 
-            prob_mesh_simp = accumulated_increased_losses / accumulated_increased_losses.sum()
-            prob_mesh_simp = prob_mesh_simp.cpu().numpy()
 
-            n_sample = int(gaussians_to_keep)
-            # n_sample = int(n_gaussian * current_sampling_factor)
-
-            indices = np.random.choice(n_gaussian, n_sample, p=prob_mesh_simp, replace=False)
+        # Progressive removal loop
+        total_to_remove = n_alive - current_target_gaussians
+        pbar = tqdm.tqdm(total=total_to_remove, desc="Removing Gaussians")
         
+        while n_alive > current_target_gaussians:
+            alive_accumulated_gt_colors = accumulated_gt_colors[alive_mask]
+            alive_accumulated_colors = accumulated_colors[alive_mask]
+            alive_accumulated_final_colors = accumulated_final_colors[alive_mask]
+            alive_accumulated_cur_colors = accumulated_cur_colors[alive_mask]
+            alive_accumulated_one_minus_alphas = accumulated_one_minus_alphas[alive_mask]
 
+            alive_potential_final_colors = (alive_accumulated_final_colors - alive_accumulated_cur_colors).clamp(min=0, max=1)
+            # alive_potential_final_colors = (alive_accumulated_colors + (alive_accumulated_final_colors - alive_accumulated_colors - alive_accumulated_cur_colors) / (alive_accumulated_one_minus_alphas.unsqueeze(-1) + 1e-6)).clamp(min=0, max=1)
+
+            # print(alive_accumulated_colors.amin(), alive_accumulated_colors.amax(), alive_accumulated_final_colors.amin(), alive_accumulated_final_colors.amax(), alive_accumulated_cur_colors.amin(), alive_accumulated_cur_colors.amax(), alive_accumulated_one_minus_alphas.amin(), alive_accumulated_one_minus_alphas.amax())
+
+            alive_current_loss = torch.abs(alive_accumulated_gt_colors - alive_accumulated_final_colors)
+
+            alive_potential_loss = torch.abs(alive_accumulated_gt_colors - alive_potential_final_colors)
+
+            alive_potential_loss_increase = alive_potential_loss - alive_current_loss
+
+            alive_potential_loss_increase = alive_potential_loss_increase.sum(dim=1)
+
+            alive_potential_loss_increase = alive_potential_loss_increase - torch.amin(alive_potential_loss_increase)
+
+            # Determine removal order based on sampling option
+            if sampling:
+                probs = 1 / (alive_potential_loss_increase + 1e-6)
+                indices_to_remove = torch.multinomial(probs, num_samples=min(removal_chunk, n_alive - gaussians_to_keep), replacement=False)
+            else:
+                if ascending:
+                    indices_to_remove = torch.argsort(alive_potential_loss_increase)[-removal_chunk:]
+                else:
+                    indices_to_remove = torch.argsort(alive_potential_loss_increase)[:removal_chunk]
+
+            removed_potential_colors = alive_potential_final_colors[indices_to_remove]
+
+            # Update final colors using correlation
+            accumulated_final_colors = update_final_colors_with_correlation(
+                means2ds, conics, radiis, valid_radiis,
+                accumulated_final_colors, removed_potential_colors,
+                indices_to_remove, alive_mask,
+                distance_sigma, distance_alpha, num_camera
+            )
+
+            # Update alive mask
+            alive_mask[indices_to_remove] = False
+            n_alive = alive_mask.sum().item()
+
+            # Update progress bar
+            removed_this_iter = len(indices_to_remove)
+            pbar.update(removed_this_iter)
+            pbar.set_postfix({
+                'remaining': n_alive - current_target_gaussians,
+                'loss_increase': alive_potential_loss_increase.mean().item(),
+                'pot': alive_potential_final_colors.mean().item()
+            })
+
+            if n_alive <= 0:
+                raise ValueError("No Gaussians left to remove")
         
+        pbar.close()
+
+
+
+
+        # (C) physical prune
+        pruning_mask = ~alive_mask
         if keep_feats or iterations != 1:
-            # simply prune the gaussians
-            # pruning mask has value True where we want to prune
-            pruning_mask = torch.zeros(n_gaussian, device=runner.splats["means"].device)
-            pruning_mask[indices] = 1
-            pruning_mask = 1 - pruning_mask
-            
-            pruning_mask = pruning_mask.bool()
-
-            splats, optimizers = remove_return(runner.splats, optimizers, runner.strategy_state, pruning_mask)
+            splats, optimizers = remove_return(runner.splats, optimizers,
+                                               runner.strategy_state,
+                                               pruning_mask)
         else:
             splats, optimizers = create_splats_and_optimizers_from_data(
-                runner.splats["means"][indices],
-                sh0_to_rgb(runner.splats["sh0"][indices]),
+                runner.splats["means"][alive_mask],
+                sh0_to_rgb(runner.splats["sh0"][alive_mask]),
                 runner=runner,
-                device=runner.splats["means"].device,
+                device=device,
                 batch_size=batch_size,
                 sparse_grad=sparse_grad,
                 visible_adam=visible_adam,
                 world_size=world_size,
                 init_scale=init_scale,
                 scene_scale=scene_scale,
-                shN=runner.splats["shN"][indices] if keep_feats else None,
-                scales=runner.splats["scales"][indices] if keep_feats else None,
-                quats=runner.splats["quats"][indices] if keep_feats else None,
-                opacities=runner.splats["opacities"][indices] if keep_feats else None,
+                shN=runner.splats["shN"][alive_mask] if keep_feats else None,
+                scales=runner.splats["scales"][alive_mask] if keep_feats else None,
+                quats=runner.splats["quats"][alive_mask] if keep_feats else None,
+                opacities=runner.splats["opacities"][alive_mask] if keep_feats else None,
                 optimizers=optimizers,
                 keep_feats=keep_feats,
-                indices=indices,
+                indices=alive_mask.nonzero(as_tuple=True)[0],
             )
-        
-        for cam_id in fully_fused_projection_outputs:
-            radii, means2d, depths, conics, compensations = fully_fused_projection_outputs[cam_id]
-            radii = radii[:, indices]
-            means2d = means2d[:, indices]
-            depths = depths[:, indices]
-            conics = conics[:, indices]
-            if compensations is not None:
-                compensations = compensations[:, indices]
-
-            fully_fused_projection_outputs[cam_id] = (radii, means2d, depths, conics, compensations)
-
-            # tiles_per_gauss, isect_ids, flatten_ids = isect_tiles_outputs[cam_id]
-
-            # Create a boolean mask for elements in "indices"
-            # mask = torch.isin(flatten_ids, indices)
-
-            # Apply mask to both tensors simultaneously
-            # filtered_flatten_ids = flatten_ids[mask]
-            # filtered_isect_ids = isect_ids[mask]
-            
-            # filtered_tiles_per_gauss = tiles_per_gauss[:, indices]
-
-            # isect_tiles_outputs[cam_id] = (filtered_tiles_per_gauss, filtered_isect_ids, filtered_flatten_ids)
-
         runner.splats = splats
 
-        print(f"iteration {iteration} done, reducing from {n_gaussian} to {len(indices)}, time: {time.time() - iter_start}")
-
-    return splats, optimizers
-
-
-
-
+    return runner.splats, optimizers
 
 
 @torch.no_grad()
@@ -714,7 +765,7 @@ def simplification_progressive(
     # Synergy (local update) parameters:
     distance_sigma: float = 2e0,
     distance_alpha: float = 1e-1,
-    removal_chunk: int = 100,  # default fallback
+    removal_chunk: int = 1000,  # default fallback
     max_removal_iterations: int = 1000,
     chunk_size_alive: int = 1e6,
     chunk_size_removed: int = 5e1,
@@ -785,8 +836,8 @@ def simplification_progressive(
             trainloader = torch.utils.data.DataLoader(
                 trainset,
                 batch_size=1,
-                shuffle=True,
-                num_workers=0,
+                shuffle=False,
+                num_workers=1,
                 persistent_workers=True,
                 pin_memory=True,
             )
@@ -1014,8 +1065,8 @@ def compare_simplifications(
         trainloader = torch.utils.data.DataLoader(
             trainset,
             batch_size=1,
-            shuffle=True,
-            num_workers=0,
+            shuffle=False,
+            num_workers=1,
             persistent_workers=True,
             pin_memory=True,
         )
@@ -1085,8 +1136,8 @@ def compare_simplifications(
         trainloader = torch.utils.data.DataLoader(
             trainset,
             batch_size=1,
-            shuffle=True,
-            num_workers=0,
+            shuffle=False,
+            num_workers=1,
             persistent_workers=True,
             pin_memory=True,
         )
@@ -1213,15 +1264,15 @@ def depth_reinitialization(
         trainloader=None,
 ):
     
-    if trainloader is None:
-        trainloader = torch.utils.data.DataLoader(
-            trainset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=0,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+    # if trainloader is None:
+    trainloader = torch.utils.data.DataLoader(
+        trainset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=1,
+        persistent_workers=True,
+        pin_memory=True,
+    )
 
     out_pts_list = []
     gt_list = []
@@ -1543,529 +1594,193 @@ def visualize_id_maps(max_ids: torch.Tensor) -> torch.Tensor:
     return output
 
 
+@torch.no_grad()
+def recover_covariance_2d(conics: torch.Tensor) -> torch.Tensor:
+    """2D 공분산 행렬을 conics로부터 복원합니다.
+    
+    Args:
+        conics: [N, 3] 형태의 텐서, 각 행은 [a, b, c] 형태로 
+               covar2d_inv의 상삼각 부분을 저장
+               
+    Returns:
+        [N, 2, 2] 형태의 2D 공분산 행렬
+    """
+    # 2x2 행렬의 역행렬 공식 사용
+    det = conics[:, 0] * conics[:, 2] - conics[:, 1] * conics[:, 1]
+    zero_mask = torch.abs(det) < 1e-8
+    
+    # 브로드캐스팅을 활용한 한 번의 나눗셈
+    conics_div_det = conics / det.unsqueeze(-1)
+    
+    # 한 번의 메모리 할당으로 cov2d 생성
+    cov2d = torch.stack([
+        torch.stack([conics_div_det[:, 2], -conics_div_det[:, 1]], dim=1),
+        torch.stack([-conics_div_det[:, 1], conics_div_det[:, 0]], dim=1)
+    ], dim=1)
+    
+    return cov2d, zero_mask, det
 
-
-
-
-
-
-
-
-
-'''
 
 @torch.no_grad()
-def simplification_progressive(
-    trainset,
-    runner,
-    parser,
-    cfg,
-    sampling_factor: float = 0.1,
-    keep_sh0: bool = True,
-    keep_feats: bool = False,
-    batch_size: int = 1,
-    sparse_grad: bool = False,
-    visible_adam: bool = False,
-    world_size: int = 1,
-    init_scale: float = 1.0,
-    scene_scale: float = 1.0,
-    optimizers=None,
-    ascending: bool = False,
-    use_mean: bool = False,
-    sampling: bool = True,
-    iterations: int = 1,
-    # Synergy (local update) parameters:
-    distance_sigma: float = 1,
-    distance_alpha: float = 1,
-    removal_chunk: int = 100,
+def update_final_colors_with_correlation(
+    means2ds, conics, radiis, valid_radiis,
+    accumulated_final_colors, removed_potential_colors,
+    indices_to_remove, alive_mask,
+    distance_sigma=2e0, distance_alpha=1e-1,
+    num_camera=1,
 ):
-    """
-    Progressive simplification:
-      1) Repeatedly compute the "true" potential loss by a full forward pass.
-      2) Compute a per-iteration removal target.
-      3) While the number of Gaussians is above the iteration target, remove a small chunk
-         by sampling using torch.multinomial (without explicit normalization) and update
-         the potential loss of neighbors using a distance-based synergy update.
-      4) Physically prune the Gaussians using remove_return.
-      5) Return the new splats and optimizers.
-
-    The full potential loss is re-computed at the start of each iteration.
-    """
-    device = runner.splats["means"].device
-    n_gaussian_initial = runner.splats["means"].shape[0]
+    """KL 발산 기반 최종 색상 업데이트 함수
     
-    if sampling_factor > 1:
-        return runner.splats, optimizers
+    Args:
+        means2ds: 모든 가우시안의 2D 평균 위치 [C, N, 2]
+        conics: 모든 가우시안의 conic 행렬 [C, N, 3]
+        radiis: 모든 가우시안의 반경 [C, N]
+        accumulated_final_colors: 누적된 최종 색상 [N, 3]
+        removed_potential_colors: 제거된 가우시안의 잠재적 색상 [n_remove, 3]
+        indices_to_remove: 제거할 가우시안의 인덱스
+        alive_mask: 생존한 가우시안의 마스크
+        distance_sigma: 거리 시그마
+        distance_alpha: 거리 알파
+        num_camera: 카메라 수
+    """
+    device = means2ds.device
+    N = means2ds.shape[1]  # 가우시안 수
+    n_remove = len(indices_to_remove)
+    alive_indices = torch.where(alive_mask)[0]
+    n_alive = len(alive_indices)
+    
+    # 모든 카메라의 유사도 누적
+    similarities_sum = torch.zeros(n_alive, device=device)
+    
+    # 모든 카메라에 대해 한 번에 처리
+    for cam_idx in range(num_camera):
+        # 현재 카메라의 means2ds와 conics
+        cam_means2ds = means2ds[cam_idx]  # [N, 2]
+        cam_conics = conics[cam_idx]  # [N, 3]
+        cam_radiis = radiis[cam_idx]  # [N]
 
-    target_n_gaussian = int(n_gaussian_initial * sampling_factor)
-    if target_n_gaussian < 1:
-        target_n_gaussian = 1  # Clamp at least 1 remains
-
-
-    # Compute overall number to remove per iteration
-    # (Total removals will be evenly distributed among iterations)
-    total_to_remove = n_gaussian_initial - target_n_gaussian
-
-    simplification_start = time.time()
-
-    pruned_gaussian_per_iteration = total_to_remove // iterations
-
-    print(f"Initial Gaussians: {n_gaussian_initial}, Target: {target_n_gaussian}, "
-          f"removing {pruned_gaussian_per_iteration} per iteration (approx).")
-
-
-    means = runner.splats["means"].detach()  # shape [n_gaussian, 3]
-    dist2_avg = (knn(means, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg.clamp(1e-6)).mean().item()
-
-    # Outer loop: each iteration recomputes the "true" potential loss.
-    for iteration in tqdm.tqdm(range(iterations)):
-        iter_start = time.time()
-        torch.cuda.synchronize()
-
-        # Update current number of Gaussians from the current splats.
-        n_gaussian = runner.splats["means"].shape[0]
-        # For this iteration, we want to keep:
-        gaussians_to_keep = n_gaussian - pruned_gaussian_per_iteration
-        # print(f"Iteration {iteration+1}: Current Gaussians: {n_gaussian}, "
-        #       f"Goal for iteration: keep {gaussians_to_keep}.")
+        # get the indices of radii > 0
+        alive_valid_mask = valid_radiis[alive_indices] 
+        removed_valid_mask = valid_radiis[indices_to_remove]
         
-        expected_removals = n_gaussian - gaussians_to_keep
-
-        # ---------------------------------------------------------------------------------
-        # 1) FULL FORWARD PASS TO RE-COMPUTE POTENTIAL LOSS (True Loss)
-        # ---------------------------------------------------------------------------------
-        trainloader = torch.utils.data.DataLoader(
-            trainset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=1,
-            persistent_workers=True,
-            pin_memory=True,
+        # KL 발산 기반 유사도 계산
+        similarities = calculate_gaussian_kl_batch(
+            cam_means2ds[alive_indices],
+            cam_conics[alive_indices],
+            cam_means2ds[indices_to_remove],
+            cam_conics[indices_to_remove],
+            alive_valid_mask,
+            removed_valid_mask
+        )  # [n_alive, n_remove]
+        
+        # 반경 기반 가중치 적용
+        # radius_weights = torch.exp(-cam_radiis[indices_to_remove] / distance_sigma)
+        # similarities = similarities * radius_weights.unsqueeze(0)
+        
+        # 유사도 정규화 및 누적
+        similarities = similarities / (num_camera * n_remove)
+        similarities_sum = similarities.sum(dim=1)
+        
+        # 색상 보간
+        accumulated_final_colors[alive_mask] = (
+            accumulated_final_colors[alive_mask] * (1 - similarities_sum).unsqueeze(-1) + 
+            (removed_potential_colors.unsqueeze(0) * similarities.unsqueeze(-1)).sum(dim=1)
         )
-        trainloader_iter = iter(trainloader)
 
-        potential_loss = torch.zeros(n_gaussian, device=device)
-        weights_count = torch.zeros(n_gaussian, device=device)
+        # if nan or inf in similarities_sum, raise
+        # if torch.isnan(similarities_sum).any() or torch.isinf(similarities_sum).any():
+        #     raise ValueError('nan or inf in similarities_sum')
 
-        for _ in tqdm.tqdm(range(len(trainloader)), desc="Compute potential loss"):
-            # dataload_start = time.time()
-            data = next(trainloader_iter)
+    # print('means2ds.mean(dim=1)', means2ds.mean(dim=1))
+    # print('means2ds.std(dim=1)', means2ds.std(dim=1))
+    # print('conics.mean(dim=1)', conics.mean(dim=1))
+    # print('conics.std(dim=1)', conics.std(dim=1))
+    # print('radiis.mean(dim=1)', radiis.mean(dim=1))
+    # print('radiis.std(dim=1)', radiis.std(dim=1))
 
-            pixel = data["image"].to(device) / 255.0
-            camtoworlds = data["camtoworld"].to(device)
-            Ks = data["K"].to(device)
-            image_ids = data["image_id"].to(device)
-            masks = data["mask"].to(device) if "mask" in data else None
-
-            # dataload_time = time.time() - dataload_start
-# 
-            height, width = pixel.shape[1:3]
-
-            # render_start = time.time()
-
-            # Forward pass; assumed to output info with "accumulated_potential_loss"
-            _, _, info = runner.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=0,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                image_ids=image_ids,
-                render_mode="RGB+IW",
-                masks=masks,
-                gt_image=pixel
-            )
-            incr_loss = info["accumulated_potential_loss"]
-            incr_count = info["accumulated_weights_count"]
-            if incr_loss.dim() == 2:
-                incr_loss = incr_loss.sum(dim=0)
-                incr_count = incr_count.sum(dim=0)
-            pix_per_image = width * height
-            partial_loss = incr_loss
-            # partial_loss = (incr_loss / pix_per_image)
-            # if use_mean:
-                # partial_loss /= incr_count.clamp_min(1)
-            potential_loss += partial_loss 
-            weights_count += incr_count
-
-            # render_time = time.time() - render_start
-
-            # print(f"Data load time: {dataload_time:.2f} sec, Render time: {render_time:.2f} sec.")
-
-        # Normalize potential_loss so that all entries are >= 0
-        if use_mean:
-            potential_loss /= weights_count.clamp_min(1)
-
-        min_val = potential_loss.min()
-        if min_val < 0:
-            potential_loss -= min_val
-
-        # -------------------------------------------------------------------------
-        # 2) PROGRESSIVELY REMOVE GAUSSIANS (LOCAL SYNERGY UPDATE)
-        # -------------------------------------------------------------------------
-        # alive_mask tracks the Gaussians that remain.
-        alive_mask = torch.ones(n_gaussian, dtype=torch.bool, device=device)
-        # We use the current positions from runner.splats["means"].
-        means = runner.splats["means"].detach()  # shape [n_gaussian, 3]
-        opacities = torch.sigmoid(runner.splats["opacities"].detach())  # shape [n_gaussian]
-
-        # Initialize a separate synergy_update array to accumulate additive updates.
-        synergy_update = torch.zeros(n_gaussian, device=device)
-
-        n_gaussians_current = n_gaussian
-        local_iter = 0
-
-        # Create a tqdm progress bar for the removals.
-        relative_removal_chunk = min(5000, max(1, expected_removals // 500))
+    return accumulated_final_colors
 
 
-        pbar = tqdm.tqdm(total=expected_removals, desc="Simplification progress")
-        while n_gaussians_current > gaussians_to_keep:
-            local_iter += 1
-
-            removal_chunk = min(relative_removal_chunk, n_gaussians_current - gaussians_to_keep)
-
-            # Compute effective potential loss used for sampling.
-            effective_loss = potential_loss * (1.0 + synergy_update)
-            alive_loss = effective_loss[alive_mask]
-            # if alive_loss.sum() < 1e-12:
-            #     print("Effective potential loss is near zero; breaking out.")
-            #     break
-
-
-                # print('alive_loss', alive_loss.min(), alive_loss.max(), alive_loss.mean(), alive_loss.std(), alive_loss.shape)
-
-            # Sample a chunk of indices (removal_chunk) among alive Gaussians.
-            # --- Conditional Sampling ---
-            if sampling:
-                # Use torch.multinomial.
-                chosen_local_idx = torch.multinomial(alive_loss, num_samples=removal_chunk, replacement=False)
-            else:
-                # Use torch.topk to choose removals deterministically (lowest effective_loss).
-                _, chosen_local_idx = torch.topk(alive_loss, k=removal_chunk, largest=False)
-
-
-            # chosen_local_idx = torch.multinomial(alive_loss, num_samples=removal_chunk, replacement=False)
-            global_alive_indices = alive_mask.nonzero(as_tuple=True)[0]
-            chosen_global_idx = global_alive_indices[chosen_local_idx]
-
-            # Vectorized synergy update:
-            removed_positions = means[chosen_global_idx]  # shape [chunk, 3]
-            removed_opacities = opacities[chosen_global_idx]  # shape [chunk]    
-            still_alive_global = alive_mask.nonzero(as_tuple=True)[0]  # shape [M]
-            alive_positions = means[still_alive_global]  # shape [M, 3]
-
-
-            M = alive_positions.shape[0]
-            chunk_size = int(1e5)  # or 1,000_000 as an integer
-                        
-            synergy_total = torch.zeros(M, device=device)  # final aggregator
-
-            # min_dists = []
-            # min_idxs  = []   # We'll store the indices in the removed_positions array
-            start = 0
-
-            while start < M:
-
-                end = min(start + chunk_size, M)
-                batch_positions = alive_positions[start:end]  # shape [batch_size, 3]
-
-                # shape [batch_size, chunk_removed, 3]
-                diff = batch_positions.unsqueeze(1) - removed_positions.unsqueeze(0)
-                dist_sq = diff.pow(2).sum(dim=2)  # shape [batch_size, chunk_removed]
-                dist = dist_sq.sqrt()            # shape [batch_size, chunk_removed]
-
-                # aggregator: sum over removed Gaussians
-                # synergy_partial[b, k] = alpha_k * exp(- dist[b, k] * distance_sigma / dist_avg)
-                # Then sum across k
-                alpha_exp = (removed_opacities * torch.exp(- dist * distance_sigma / dist_avg))  # shape [batch_size, chunk_removed]
-                batch_sum = alpha_exp.sum(dim=1)  # shape [batch_size]
-
-                synergy_total[start:end] = batch_sum
-                start = end
-
-            #     end = min(start + chunk_size, M)
-            #     batch = alive_positions[start:end]  # shape [batch_size, 3]
-
-            #     # Now compute the difference for just this batch:
-            #     diff = batch.unsqueeze(1) - removed_positions.unsqueeze(0)  # shape [batch_size, chunk, 3]
-            #     dist_sq = diff.pow(2).sum(dim=2)  # [batch_size, chunk]
-            #     batch_min_dist, batch_min_idx  = dist_sq.sqrt().min(dim=1)  # [batch_size]
-
-            #     min_dists.append(batch_min_dist)
-            #     min_idxs.append(batch_min_idx)
-            #     start = end
-
-            # # Now concatenate them into one big [M] array
-            # min_dist = torch.cat(min_dists, dim=0)   # shape [M]
-            # min_idx  = torch.cat(min_idxs, dim=0)    # shape [M]
-
-            # print('dis',min_dist.min(), min_dist.max(), min_dist.mean(), min_dist.std())
-            synergy_factor = synergy_total
-            # synergy_factor = torch.exp(-min_dist * distance_sigma / dist_avg)
-
-            # closest_opac = removed_opacities[min_idx]  # shape [M]
-            # synergy_factor *= closest_opac  # incorporate transparency
-
-            # print('syn', synergy_factor.min(), synergy_factor.max(), synergy_factor.mean(), synergy_factor.std())
-            # Exclude the ones chosen for removal:
-            # mask = ~torch.isin(still_alive_global, chosen_global_idx)
-            update_indices = still_alive_global
-            update_synergy = synergy_factor
-            # Instead of directly multiplying potential_loss, accumulate additively in synergy_update.
-            synergy_update[update_indices] += distance_alpha * update_synergy
-
-            # Mark the chosen ones as removed.
-            alive_mask[chosen_global_idx] = False
-            n_gaussians_current = alive_mask.sum().item()
-
-            pbar.update(removal_chunk)
-            pbar.set_postfix(remaining=n_gaussians_current, removed=removal_chunk)
-        pbar.close()
-
-        # -------------------------------------------------------------------------
-        # 3) PHYSICAL REMOVAL: UPDATE THE SPLATS VIA remove_return
-        # -------------------------------------------------------------------------
-        pruning_mask = ~alive_mask  # True for Gaussians to remove.
-        if keep_feats or iterations != 1:
-            splats, optimizers = remove_return(runner.splats, optimizers, runner.strategy_state, pruning_mask)
-        else:
-            splats, optimizers = create_splats_and_optimizers_from_data(
-                runner.splats["means"][alive_mask],
-                sh0_to_rgb(runner.splats["sh0"][alive_mask]),
-                runner=runner,
-                device=runner.splats["means"].device,
-                batch_size=batch_size,
-                sparse_grad=sparse_grad,
-                visible_adam=visible_adam,
-                world_size=world_size,
-                init_scale=init_scale,
-                scene_scale=scene_scale,
-                shN=runner.splats["shN"][alive_mask] if keep_feats else None,
-                scales=runner.splats["scales"][alive_mask] if keep_feats else None,
-                quats=runner.splats["quats"][alive_mask] if keep_feats else None,
-                opacities=runner.splats["opacities"][alive_mask] if keep_feats else None,
-                optimizers=optimizers,
-                keep_feats=keep_feats,
-                indices=alive_mask.nonzero(as_tuple=True)[0],
-            )
-        runner.splats = splats
-
-        n_gaussians_after = runner.splats["means"].shape[0]
-        iter_time = time.time() - iter_start
-        # print(f"Iteration {iteration+1} complete: Reduced from {n_gaussian} to {n_gaussians_after} Gaussians in {iter_time:.2f} sec.")
-
-    simplification_time = time.time() - simplification_start
-    print(f"Simplification complete, from {n_gaussian_initial} to {n_gaussians_after} Gaussians in {simplification_time:.2f} sec.")
-
-    return splats, optimizers
-
-
-
-
-'''
-
-
-
-
-
-# def visualize_id_maps(max_ids: torch.Tensor) -> torch.Tensor:
-#     B, H, W = max_ids.shape
-#     output = torch.zeros((B, 3, H, W), dtype=torch.float32)
+@torch.no_grad()
+def calculate_gaussian_kl_batch(means2ds1, conics1, means2ds2, conics2, alive_valid_mask, removed_valid_mask):
+    """가우시안 간의 KL 발산을 계산하는 함수
     
-#     # Define color palette (RGB values) with about 30 colors
-#     colors = torch.tensor([
-#         [0.12, 0.47, 0.71],  # blue
-#         [0.98, 0.50, 0.45],  # red
-#         [0.17, 0.63, 0.17],  # green
-#         [0.58, 0.40, 0.74],  # purple
-#         [0.55, 0.34, 0.29],  # brown
-#         [0.89, 0.47, 0.76],  # pink
-#         [0.74, 0.74, 0.13],  # yellow
-#         [0.09, 0.75, 0.81],  # cyan
-#         [0.40, 0.40, 0.40],  # gray
-#         [0.91, 0.54, 0.76],  # light pink
-#         [0.65, 0.81, 0.89],  # light blue
-#         [0.99, 0.75, 0.44],  # orange
-#         [0.68, 0.92, 0.67],  # light green
-#         [0.84, 0.66, 0.87],  # lavender
-#         [0.75, 0.55, 0.53],  # tan
-#         [0.98, 0.78, 0.95],  # light magenta
-#         [0.94, 0.94, 0.55],  # pale yellow
-#         [0.55, 0.87, 0.87],  # aqua
-#         [0.75, 0.75, 0.75],  # silver
-#         [1.00, 0.60, 0.60],  # salmon
-#         [0.60, 1.00, 0.60],  # light lime
-#         [0.60, 0.60, 1.00],  # periwinkle
-#         [0.80, 0.80, 0.40],  # olive
-#         [0.40, 0.80, 0.80],  # teal
-#         [0.35, 0.70, 0.90],  # sky blue
-#         [0.90, 0.35, 0.70],  # hot pink
-#         [0.70, 0.90, 0.35],  # lime green
-#         [0.35, 0.90, 0.70],  # sea green
-#         [0.90, 0.70, 0.35],  # amber
-#         [0.70, 0.35, 0.90],  # violet
-#     ], dtype=torch.float32)
-    
-#     for b in range(B):
-#         # Cluster similar regions
-#         unique_ids = torch.unique(max_ids[b])
-#         print(len(unique_ids))
-#         color_mapping = unique_ids % len(colors)
-#         print(color_mapping)
-#         # Assign colors
-#         for idx, color_idx in enumerate(color_mapping):
-#             mask = (max_ids[b] == unique_ids[idx])
-#             output[b, :, mask] = colors[color_idx].view(3, 1)
-#         print("done")
-#     return output
-
-
-
-
-# @torch.no_grad()
-# def simplification_from_mesh_simp(
-#     trainset: Dataset, 
-#     runner,
-#     parser,
-#     cfg,
-#     sampling_factor: float = 0.1,
-#     keep_sh0: bool = True,
-#     keep_feats: bool = False,
-#     batch_size: int = 1,
-#     sparse_grad: bool = False,
-#     visible_adam: bool = False,
-#     world_size: int = 1,
-#     init_scale: float = 1.0,
-#     scene_scale: float = 1.0,
-#     optimizers=None,
-#     abs_ratio=False,
-#     ascending=False,
-#     use_mean = False,
-#     sampling = False,
-# ):
-    
-#     trainloader = torch.utils.data.DataLoader(
-#         trainset,
-#         batch_size=1,
-#         shuffle=True,
-#         num_workers=1,
-#         persistent_workers=True,
-#         pin_memory=True,
-#     )
-
-#     n_gaussian = runner.splats["means"].shape[0]
-
-#     importance_scores = torch.zeros(n_gaussian, device=runner.splats["means"].device)
-#     pixels_per_gaussian = torch.zeros(n_gaussian, device=runner.splats["means"].device, dtype=torch.int)
-
-#     trainloader_iter = iter(trainloader)
-
-#     accumulated_increased_losses = torch.zeros(n_gaussian, device=runner.splats["means"].device)
-#     accumulated_weights_counts = torch.zeros(n_gaussian, device=runner.splats["means"].device)
-
-#     for _ in tqdm.tqdm(range(len(trainloader))):
-#         data = next(trainloader_iter)
-
-#         pixel = data["image"].to(runner.splats["means"].device) / 255.0
-#         camtoworlds = camtoworlds_gt = data["camtoworld"].to(runner.splats["means"].device)
-#         Ks = data["K"].to(runner.splats["means"].device)
-#         image_ids = data["image_id"].to(runner.splats["means"].device)
-#         masks = data["mask"].to(runner.splats["means"].device) if "mask" in data else None
-
-#         width, height = pixel.shape[1:3]
-
-#         # forward
-#         _, _, info = runner.rasterize_splats(
-#             camtoworlds=camtoworlds,
-#             Ks=Ks,
-#             width=width,
-#             height=height,
-#             sh_degree=0,
-#             near_plane=cfg.near_plane,
-#             far_plane=cfg.far_plane,
-#             image_ids=image_ids,
-#             render_mode="RGB+IW",
-#             masks=masks,
-#             gt_image=pixel
-#         )
-
-#         increased_losses = info["accumulated_potential_loss"]
-#         accumulated_weights_count = info["accumulated_weights_count"]
-
-#         accumulated_increased_losses += (increased_losses.sum(dim=0) / (width * height))
-#         accumulated_weights_counts += accumulated_weights_count.sum(dim=0)
-
-#         if torch.isnan(increased_losses).any():
-#             exit()
-
-#     # Add fixed pruning indices: that accumulated_increased_losses < 0
-#     fixed_pruning_indices = accumulated_increased_losses < 0
-#     fixed_pruning_indices = torch.nonzero(fixed_pruning_indices, as_tuple=True)[0]
-
-#     accumulated_increased_losses = accumulated_increased_losses - torch.amin(accumulated_increased_losses)  # since accumulated_increased_losses can have negative values
-
-#     if use_mean:
-#         accumulated_increased_losses /= accumulated_weights_counts.clamp(min=1)
-
-#     # indices to keep
-#     if not sampling:
-#         indices = torch.argsort(accumulated_increased_losses, descending=False if ascending else True)[:int(n_gaussian * sampling_factor)]
+    Args:
+        means2ds1: 첫 번째 가우시안들의 2D 평균 위치 [N1, 2]
+        conics1: 첫 번째 가우시안들의 conic 행렬 [N1, 3] (공분산 행렬의 역행렬)
+        means2ds2: 두 번째 가우시안들의 2D 평균 위치 [N2, 2]
+        conics2: 두 번째 가우시안들의 conic 행렬 [N2, 3] (공분산 행렬의 역행렬)
+        alive_valid_mask: 유효한 생존 가우시안의 마스크
+        removed_valid_mask: 유효한 제거 가우시안의 마스크
         
-#     else:
-#         # same as simplification - making prob 
-#         # inverse_losses = 1.0 / (accumulated_increased_losses + 1e-10)  # Add small epsilon to avoid division by zero
-
-#         prob_mesh_simp = accumulated_increased_losses / accumulated_increased_losses.sum()
-#         prob_mesh_simp = prob_mesh_simp.cpu().numpy()
-
-#         n_sample = int(n_gaussian * sampling_factor)
-
-#         indices = np.random.choice(n_gaussian, n_sample, p=prob_mesh_simp, replace=False)
+    Returns:
+        KL 발산 값 [N1, N2]
+    """
+    N1, _ = means2ds1.shape
+    N2, _ = means2ds2.shape
+    similarity = torch.zeros(N1, N2, device=means2ds1.device)
     
-#     # remove fixed pruning indices
-#     # the indices is the indices for keeping
-#     indices = [i for i in indices if i not in fixed_pruning_indices]
+    # 유효한 인덱스에 대해서만 계산
+    valid_means2ds1 = means2ds1[alive_valid_mask]
+    valid_means2ds2 = means2ds2[removed_valid_mask]
+    valid_conics1 = conics1[alive_valid_mask]
+    valid_conics2 = conics2[removed_valid_mask]
+    
+    # n_valid1 = len(alive_valid_indices)
+    # n_valid2 = len(removed_valid_indices)
 
-#     # indices_ = torch.argsort(accumulated_increased_losses, descending=False)[:int(n_gaussian * sampling_factor)]
-#     # print("descending", torch.sigmoid(runner.splats["opacities"][indices_]).min(), torch.sigmoid(runner.splats["opacities"][indices_]).max(),\
-#     #     torch.sigmoid(runner.splats["opacities"][indices_]).mean(), torch.sigmoid(runner.splats["opacities"][indices_]).std())
-#     # indices_ = torch.argsort(accumulated_increased_losses, descending=True)[:int(n_gaussian * sampling_factor)]
-#     # print("ascending", torch.sigmoid(runner.splats["opacities"][indices_]).min(), torch.sigmoid(runner.splats["opacities"][indices_]).max(),\
-#     #     torch.sigmoid(runner.splats["opacities"][indices_]).mean(), torch.sigmoid(runner.splats["opacities"][indices_]).std())
+    # 2D 공분산 행렬 복원과 행렬식 계산을 한 번에
+    det1 = valid_conics1[:, 0] * valid_conics1[:, 2] - valid_conics1[:, 1] * valid_conics1[:, 1]
+    det2 = valid_conics2[:, 0] * valid_conics2[:, 2] - valid_conics2[:, 1] * valid_conics2[:, 1]
+    zero_mask = torch.logical_or(
+        (torch.abs(det1) < 1e-8).unsqueeze(1),
+        (torch.abs(det2) < 1e-8).unsqueeze(0)
+    )
+    det_cov1 = 1 / det1
+    det_cov2 = 1 / det2
+    
+    # conics1을 공분산 행렬로 변환
+    cov1 = torch.stack([
+        torch.stack([valid_conics1[:, 2] / det1, -valid_conics1[:, 1] / det1], dim=1),
+        torch.stack([-valid_conics1[:, 1] / det1, valid_conics1[:, 0] / det1], dim=1)
+    ], dim=1)  # [n_valid1, 2, 2]
+    
+    # 차이 계산 [n_valid1, n_valid2, 2]
+    diff = valid_means2ds1.unsqueeze(1) - valid_means2ds2.unsqueeze(0)
+    
+    # 마할라노비스 항 계산 최적화
+    # (x-y)^T Σ^-1 (x-y) = (x-y)^T [a b; b c] (x-y)
+    # = a(x1-y1)^2 + 2b(x1-y1)(x2-y2) + c(x2-y2)^2
+    diff_sq = diff * diff  # [n_valid1, n_valid2, 2]
+    mahalanobis_term = (
+        valid_conics2[:, 0].unsqueeze(0) * diff_sq[..., 0] +  # a(x1-y1)^2
+        2 * valid_conics2[:, 1].unsqueeze(0) * diff[..., 0] * diff[..., 1] +  # 2b(x1-y1)(x2-y2)
+        valid_conics2[:, 2].unsqueeze(0) * diff_sq[..., 1]  # c(x2-y2)^2
+    )
+    
+    # 대각합 항 계산 최적화
+    # tr(Σ2^-1 Σ1) = tr([a2 b2; b2 c2] [a1 b1; b1 c1])
+    # = a2*a1 + 2*b2*b1 + c2*c1
+    trace_term = (
+        valid_conics2[:, 0].unsqueeze(0) * cov1[:, 0, 0].unsqueeze(1) +  # a2*a1
+        2 * valid_conics2[:, 1].unsqueeze(0) * cov1[:, 0, 1].unsqueeze(1) +  # 2*b2*b1
+        valid_conics2[:, 2].unsqueeze(0) * cov1[:, 1, 1].unsqueeze(1)  # c2*c1
+    )
+    
+    # 로그 행렬식 항 계산
+    log_det_term = torch.log((det_cov2.unsqueeze(0) / det_cov1.unsqueeze(1)).abs().clamp(min=1e-10))
+    
+    # 최종 KL 발산 계산
+    kl_div = 0.5 * (trace_term + mahalanobis_term - 2 + log_det_term)
+    kl_div = kl_div.clamp(min=0)
 
-#     if keep_feats:
-#         # simply prune the gaussians
-#         # pruning mask has value True where we want to prune
-#         pruning_mask = torch.zeros(n_gaussian, device=runner.splats["means"].device)
-#         pruning_mask[indices] = 1
-#         pruning_mask = 1 - pruning_mask
-        
-#         pruning_mask = pruning_mask.bool()
+    valid_similarities = torch.exp(-kl_div)
+    valid_similarities[zero_mask] = 0
 
-#         splats, optimizers = remove_return(runner.splats, optimizers, runner.strategy_state, pruning_mask)
-#     else:
-#         splats, optimizers = create_splats_and_optimizers_from_data(
-#             runner.splats["means"][indices],
-#             sh0_to_rgb(runner.splats["sh0"][indices]),
-#             runner=runner,
-#             device=runner.splats["means"].device,
-#             batch_size=batch_size,
-#             sparse_grad=sparse_grad,
-#             visible_adam=visible_adam,
-#             world_size=world_size,
-#             init_scale=init_scale,
-#             scene_scale=scene_scale,
-#             shN=runner.splats["shN"][indices] if keep_feats else None,
-#             scales=runner.splats["scales"][indices] if keep_feats else None,
-#             quats=runner.splats["quats"][indices] if keep_feats else None,
-#             opacities=runner.splats["opacities"][indices] if keep_feats else None,
-#             optimizers=optimizers,
-#             keep_feats=keep_feats,
-#             indices=indices,
-#         )
+    valid_radiis = torch.logical_and(alive_valid_mask.unsqueeze(1), removed_valid_mask.unsqueeze(0))
 
-#     return splats, optimizers
+    # 유효한 인덱스에 대해서만 결과 저장
+    similarity[valid_radiis] = valid_similarities
+
+    return similarity
+

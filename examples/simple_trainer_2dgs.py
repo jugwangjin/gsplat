@@ -36,7 +36,7 @@ from gsplat.strategy import DefaultStrategy
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     # Path to the .pt file. If provide, it will skip training and render a video
     ckpt: Optional[str] = None
 

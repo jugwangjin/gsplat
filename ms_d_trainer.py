@@ -857,7 +857,8 @@ class Runner:
                         device=self.device,
                         init_type=cfg.init_type,
                         optimizers=self.optimizers,
-                        replace=True
+                        replace=True,
+                        trainloader=trainloader
                     )
                     
                     self.cfg.strategy.check_sanity(self.splats, self.optimizers)

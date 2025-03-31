@@ -53,6 +53,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &gsplat::fully_fused_projection_packed_bwd_tensor
     );
 
+    m.def(
+        "rasterize_to_pixels_fwd_approx",
+        &gsplat::rasterize_to_pixels_fwd_approx_tensor
+    );
+    m.def(
+        "rasterize_to_pixels_bwd_approx",
+        &gsplat::rasterize_to_pixels_bwd_approx_tensor);
     m.def("compute_relocation", &gsplat::compute_relocation_tensor);
 
     // 2DGS

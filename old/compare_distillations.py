@@ -48,7 +48,7 @@ import math
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     # Path to the teacher's .pt files. With this, student is initialized with the teacher's GSs and gets supervised from teacher's depths.
     teacher_ckpt: str = None
     # The teacher's sampling ratio. If 0.1, the 10% of the teacher's GSs are used for the student.

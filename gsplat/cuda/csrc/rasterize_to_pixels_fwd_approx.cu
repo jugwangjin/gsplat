@@ -13,7 +13,7 @@ namespace cg = cooperative_groups;
  ****************************************************************************/
 
 template <uint32_t COLOR_DIM, typename S>
-__global__ void rasterize_to_pixels_fwd_kernel(
+__global__ void rasterize_to_pixels_fwd_approx_kernel(
     const uint32_t C,
     const uint32_t N,
     const uint32_t n_isects,
@@ -32,30 +32,26 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     const int32_t *__restrict__ tile_offsets, // [C, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
 
-    const S *__restrict__ gt_image, // [C, image_height, image_width, COLOR_DIM]
+    const S *__restrict__ gt_image, // [C, image_height, image_width, 3]
 
     S *__restrict__ render_colors, // [C, image_height, image_width, COLOR_DIM]
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids, // [C, image_height, image_width]
     int32_t *__restrict__ max_ids, // [C, image_height, image_width]
     S *__restrict__ accumulated_weights_value, // [C, N]
-    int32_t *__restrict__ accumulated_weights_count, // [C, N]
+    int32_t *__restrict__ accumulated_count, // [C, N]
     S *__restrict__ max_weight_depths, // [C, image_height, image_width, 1]
-    S *__restrict__ accumulated_potential_loss // [C, N]
+    S *__restrict__ accumulated_cur_colors, // [C, N, 3] - cur_color RGB 누적
+    S *__restrict__ accumulated_final_colors, // [C, N, 3] - final rendered color RGB 누적
+    S *__restrict__ accumulated_one_minus_alphas, // [C, N] - (1-alpha) 누적
+    S *__restrict__ accumulated_colors, // [C, N, 3] - 누적된 색상 값
+    S *__restrict__ accumulated_gt_colors // [C, N, 3] - GT 이미지 색상 누적
 ) {
-    // each thread draws one pixel, but also timeshares caching gaussians in a
-    // shared tile
-
     auto block = cg::this_thread_block();
-    int32_t camera_id = block.group_index().x;
-    int32_t tile_id =
-        block.group_index().y * tile_width + block.group_index().z;
+    uint32_t camera_id = block.group_index().x;
+    uint32_t tile_id = block.group_index().y * tile_width + block.group_index().z;
     uint32_t i = block.group_index().y * tile_size + block.thread_index().y;
     uint32_t j = block.group_index().z * tile_size + block.thread_index().x;
-
-    int32_t max_id;
-    S max_weight;
-    S max_depth;
 
     tile_offsets += camera_id * tile_height * tile_width;
     render_colors += camera_id * image_height * image_width * COLOR_DIM;
@@ -63,16 +59,11 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     last_ids += camera_id * image_height * image_width;
     max_ids += camera_id * image_height * image_width;
     max_weight_depths += camera_id * image_height * image_width;
-
     
     if (gt_image != nullptr) {
         gt_image += camera_id * image_height * image_width * 3;
     }
-
-    max_id = -1;
-    max_weight = 0.0f;
-    max_depth = 0.0f;
-
+    
     if (backgrounds != nullptr) {
         backgrounds += camera_id * COLOR_DIM;
     }
@@ -80,80 +71,53 @@ __global__ void rasterize_to_pixels_fwd_kernel(
         masks += camera_id * tile_height * tile_width;
     }
 
-    S px = (S)j + 0.5f;
-    S py = (S)i + 0.5f;
-    int32_t pix_id = i * image_width + j;
+    const S px = (S)j + 0.5f;
+    const S py = (S)i + 0.5f;
+    const int32_t pix_id = i * image_width + j;
 
-    // return if out of bounds
-    // keep not rasterizing threads around for reading data
     bool inside = (i < image_height && j < image_width);
     bool done = !inside;
-    bool done_ = !inside;
 
-    // when the mask is provided, render the background color and return
-    // if this tile is labeled as False
     if (masks != nullptr && inside && !masks[tile_id]) {
         for (uint32_t k = 0; k < COLOR_DIM; ++k) {
-            render_colors[pix_id * COLOR_DIM + k] =
-                backgrounds == nullptr ? 0.0f : backgrounds[k];
+            render_colors[pix_id * COLOR_DIM + k] = backgrounds == nullptr ? 0.0f : backgrounds[k];
         }
-            
         max_ids[pix_id] = -1;
-
         return;
     }
 
-    // have all threads in tile process the same gaussians in batches
-    // first collect gaussians between range.x and range.y in batches
-    // which gaussians to look through in this tile
     int32_t range_start = tile_offsets[tile_id];
-    int32_t range_end =
-        (camera_id == C - 1) && (tile_id == tile_width * tile_height - 1)
-            ? n_isects
-            : tile_offsets[tile_id + 1];
+    int32_t range_end = (camera_id == C - 1) && (tile_id == tile_width * tile_height - 1)
+        ? n_isects
+        : tile_offsets[tile_id + 1];
     const uint32_t block_size = block.size();
-    uint32_t num_batches =
-        (range_end - range_start + block_size - 1) / block_size;
+    const uint32_t num_batches = (range_end - range_start + block_size - 1) / block_size;
 
     extern __shared__ int s[];
-    int32_t *id_batch = (int32_t *)s; // [block_size]
-    vec3<S> *xy_opacity_batch =
-        reinterpret_cast<vec3<float> *>(&id_batch[block_size]); // [block_size]
-    vec3<S> *conic_batch =
-        reinterpret_cast<vec3<float> *>(&xy_opacity_batch[block_size]
-        ); // [block_size]
+    int32_t *id_batch = (int32_t *)s;
+    vec3<S> *xy_opacity_batch = reinterpret_cast<vec3<float> *>(&id_batch[block_size]);
+    vec3<S> *conic_batch = reinterpret_cast<vec3<float> *>(&xy_opacity_batch[block_size]);
 
-    // current visibility left to render
-    // transmittance is gonna be used in the backward pass which requires a high
-    // numerical precision so we use double for it. However double make bwd 1.5x
-    // slower so we stick with float for now.
     S T = 1.0f;
-    S T_ = 1.0f;
-    // index of most recent gaussian to write to this thread's pixel
     uint32_t cur_idx = 0;
-
-    // collect and process batches of gaussians
-    // each thread loads one gaussian at a time before rasterizing its
-    // designated pixel
     uint32_t tr = block.thread_rank();
-
     S pix_out[COLOR_DIM] = {0.f};
-    S pix_out_[COLOR_DIM] = {0.f};
+    S max_depth = 0.0f;
+    int32_t max_id = -1;
+    S max_weight = 0.0f;
 
+    int32_t max_index = 0;
 
+    // First pass: accumulate colors and find max depth
     for (uint32_t b = 0; b < num_batches; ++b) {
-        // resync all threads before beginning next batch
-        // end early if entire tile is done
         if (__syncthreads_count(done) >= block_size) {
             break;
         }
 
-        // each thread fetch 1 gaussian from front to back
-        // index of gaussian to load
         uint32_t batch_start = range_start + block_size * b;
         uint32_t idx = batch_start + tr;
         if (idx < range_end) {
-            int32_t g = flatten_ids[idx]; // flatten index in [C * N] or [nnz]
+            int32_t g = flatten_ids[idx];
             id_batch[tr] = g;
             const vec2<S> xy = means2d[g];
             const S opac = opacities[g];
@@ -161,17 +125,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             conic_batch[tr] = conics[g];
         }
 
-        // wait for other threads to collect the gaussians in batch
         block.sync();
-        
-
-        // process gaussians in the current batch for this pixel
         uint32_t batch_size = min(block_size, range_end - batch_start);
-
-
-        // create a temporary array to store vis (alpha * T) for each gaussian
-        // the size of array can be calculated by the for loop's condition
-        // but we use block_size for simplicity
 
         for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
             const vec3<S> conic = conic_batch[t];
@@ -187,191 +142,134 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             }
 
             const S next_T = T * (1.0f - alpha);
-            if (next_T <= 1e-4) { // this pixel is done: exclusive
+            if (next_T <= 1e-4) {
                 done = true;
+                max_index = batch_start + t;
                 break;
             }
 
-
             int32_t g = id_batch[t];
             const S vis = alpha * T;
-            
-
             const S *c_ptr = colors + g * COLOR_DIM;
+
+            // // Store cur_color contribution (RGB only)
+            // GSPLAT_PRAGMA_UNROLL
+            // for (uint32_t k = 0; k < 3; ++k) {
+            // }
+
+            // Store (1-alpha)
+            atomicAdd(&accumulated_one_minus_alphas[g], 1.0f - alpha);
+
+            // accumulate colors (full dimension)
+            GSPLAT_PRAGMA_UNROLL
+            for (uint32_t k = 0; k < 3; ++k) {
+                atomicAdd(&accumulated_colors[g * 3 + k], pix_out[k]);
+            }
+
+            // Accumulate colors
             GSPLAT_PRAGMA_UNROLL
             for (uint32_t k = 0; k < COLOR_DIM; ++k) {
-                pix_out[k] += c_ptr[k] * vis;
+                S cur_color = c_ptr[k] * vis;
+                if (k < 3) {
+                    atomicAdd(&accumulated_cur_colors[g * 3 + k], cur_color);
+                }
+
+                pix_out[k] += cur_color;
             }
-            
+
+            // Update max depth and weight
             if (vis > max_weight) {
                 max_id = g;
                 max_weight = vis;
-                // the depth is defined as the last channel of the colors; c_ptr
                 max_depth = c_ptr[COLOR_DIM - 1];
             }
 
-            // accumulate weights for the backward pass
+            // Update accumulated weights and counts
             atomicAdd(&accumulated_weights_value[g], vis);
-            atomicAdd(&accumulated_weights_count[g], 1);
+            atomicAdd(&accumulated_count[g], 1);
 
             cur_idx = batch_start + t;
-
-            // if (gt_image != nullptr) {
-            //     int32_t local_cur_idx = batch_start - range_start + t;
-            //     // store the vis in the temporary array
-            //     alpha_batch[local_cur_idx] = alpha;
-            //     g_batch[local_cur_idx] = id_batch[t];
-            //     Ts_batch[local_cur_idx] = T;
-
-            // }
             T = next_T;
         }
     }
 
 
-    if (inside && gt_image != nullptr){
-        // Only cover 3D (RGB) gt_image, no matter how many dimensions the rendered images or gt_image have. 
-        // Accumulate again, computing the potential error when we omit each gaussian
+    // second pass:
+    // 1. update final colors for contributing Gaussians
+    // 2. update gt colors for contributing Gaussians
 
-        S cur_color_loss[3] = {0.0f};
-        // calculate L1 loss (abs) for each channel between pix_out and gt_image
-        for (uint32_t k = 0; k < 3; ++k) {
-            S diff = pix_out[k] - gt_image[pix_id * 3 + k];
-            cur_color_loss[k] = diff;
-            // pix_out[k] = gt_image[pix_id * 3 + k];
-        // cur_color_loss[k] = diff >= 0 ? diff : -diff;
+    S T_ = 1.0f;  // Initialize to 1.0 like in first pass
+    bool done_ = false;
+
+    // First pass: accumulate colors and find max depth
+    for (uint32_t b = 0; b < num_batches; ++b) {
+        if (__syncthreads_count(done_) >= block_size) {
+            break;
         }
 
-        S cur_color[COLOR_DIM] = {0.0f};
-        S remaining_color[COLOR_DIM] = {0.0f};
-        S expected_color[COLOR_DIM] = {0.0f};
-        S potential_loss[3] = {0.0f};
-        S expected_loss_inc = 0.0f;
-        
-        for (uint32_t b = 0; b < num_batches; ++b) {
-            // resync all threads before beginning next batch
-            // end early if entire tile is done
-            if (__syncthreads_count(done_) >= block_size) {
+        uint32_t batch_start = range_start + block_size * b;
+        uint32_t idx = batch_start + tr;
+        if (idx < range_end) {
+            int32_t g = flatten_ids[idx];
+            id_batch[tr] = g;
+            const vec2<S> xy = means2d[g];
+            const S opac = opacities[g];
+            xy_opacity_batch[tr] = {xy.x, xy.y, opac};
+            conic_batch[tr] = conics[g];
+        }
+
+        block.sync();
+        uint32_t batch_size = min(block_size, range_end - batch_start);
+
+        for (uint32_t t = 0; (t < batch_size) && !done_; ++t) {
+            const vec3<S> conic = conic_batch[t];
+            const vec3<S> xy_opac = xy_opacity_batch[t];
+            const S opac = xy_opac.z;
+            const vec2<S> delta = {xy_opac.x - px, xy_opac.y - py};
+            const S sigma = 0.5f * (conic.x * delta.x * delta.x +
+                                    conic.z * delta.y * delta.y) +
+                            conic.y * delta.x * delta.y;
+            S alpha = min(0.999f, opac * __expf(-sigma));
+            if (sigma < 0.f || alpha < 1.f / 255.f) {
+                continue;
+            }
+
+            const S next_T_ = T_ * (1.0f - alpha);
+            if (next_T_ <= 1e-4) {
+                done_ = true;
                 break;
             }
 
-            // each thread fetch 1 gaussian from front to back
-            // index of gaussian to load
-            uint32_t batch_start = range_start + block_size * b;
-            uint32_t idx = batch_start + tr;
-            if (idx < range_end) {
-                int32_t g = flatten_ids[idx]; // flatten index in [C * N] or [nnz]
-                id_batch[tr] = g;
-                const vec2<S> xy = means2d[g];
-                const S opac = opacities[g];
-                xy_opacity_batch[tr] = {xy.x, xy.y, opac};
-                conic_batch[tr] = conics[g];
-            }
+            int32_t g = id_batch[t];
+            const S vis = alpha * T_;
 
-            // wait for other threads to collect the gaussians in batch
-            block.sync();
-            
+            cur_idx = batch_start + t;
+            T_ = next_T_;
 
-            // process gaussians in the current batch for this pixel
-            uint32_t batch_size = min(block_size, range_end - batch_start);
-
-
-            // create a temporary array to store vis (alpha * T) for each gaussian
-            // the size of array can be calculated by the for loop's condition
-            // but we use block_size for simplicity
-
-            for (uint32_t t = 0; (t < batch_size) && !done_; ++t) {
-                const vec3<S> conic = conic_batch[t];
-                const vec3<S> xy_opac = xy_opacity_batch[t];
-                const S opac = xy_opac.z;
-                const vec2<S> delta = {xy_opac.x - px, xy_opac.y - py};
-                const S sigma = 0.5f * (conic.x * delta.x * delta.x +
-                                        conic.z * delta.y * delta.y) +
-                                conic.y * delta.x * delta.y;
-                S alpha = min(0.999f, opac * __expf(-sigma));
-                if (sigma < 0.f || alpha < 1.f / 255.f) {
-                    continue;
-                }
-
-                const S next_T = T_ * (1.0f - alpha);
-                if (next_T <= 1e-4) { // this pixel is done: exclusive
-                    done_ = true;
-                    break;
-                }
-
-                int32_t g = id_batch[t];
-                const S vis = alpha * T_;
-                
-                const S *c_ptr = colors + g * COLOR_DIM;
-                GSPLAT_PRAGMA_UNROLL
-                for (uint32_t k = 0; k < 3; ++k) {
-                    cur_color[k] = c_ptr[k] * vis;
-                    remaining_color[k] = pix_out[k] - cur_color[k] - pix_out_[k];
-                    expected_color[k] = pix_out_[k] + remaining_color[k] / (1-alpha);
-                    pix_out_[k] += cur_color[k];
-
-                    // 기존 potential_loss 계산 부분 주석 처리
-                    // potential_loss[k] = expected_color[k] - gt_image[pix_id * 3 + k];
-                    // potential_loss[k] = potential_loss[k] >= 0 ? potential_loss[k] : -potential_loss[k];
-                    
-                    // 현재 렌더링된 색상과 예상 색상 간의 차이 계산
-                    potential_loss[k] = expected_color[k] - pix_out[k];
-                    expected_loss_inc = potential_loss[k] >= 0 ? potential_loss[k] : -potential_loss[k];
-
-                    // expected_loss_inc = potential_loss[k] - cur_color_loss[k];
-                    expected_loss_inc = expected_loss_inc * vis;
-                    atomicAdd(&accumulated_potential_loss[g], expected_loss_inc);
-                    // atomicAdd(&accumulated_potential_loss[g], potential_loss[k]);
-                    
-                }
-                
-                // final rendered rgb image : pix_out
-                // the effect of current gaussian's color: c_ptr * vis
-                // the effect of remaining gaussians: pix_out - c_ptr * vis - pix_out_
-                // when we omit this gaussian, the remaining gaussian's colors will T/next_T
-
-                T_ = next_T;
+            // update final colors for contributing Gaussians
+            GSPLAT_PRAGMA_UNROLL
+            for (uint32_t k = 0; k < 3; ++k) {
+                atomicAdd(&accumulated_final_colors[g * 3 + k], pix_out[k]);
+                atomicAdd(&accumulated_gt_colors[g * 3 + k], gt_image[pix_id * 3 + k]);
             }
         }
     }
 
-
-
-
-
-
-
     if (inside) {
-        // Here T is the transmittance AFTER the last gaussian in this pixel.
-        // We (should) store double precision as T would be used in backward
-        // pass and it can be very small and causing large diff in gradients
-        // with float32. However, double precision makes the backward pass 1.5x
-        // slower so we stick with float for now.
-
-
         render_alphas[pix_id] = 1.0f - T;
-        GSPLAT_PRAGMA_UNROLL
         for (uint32_t k = 0; k < COLOR_DIM; ++k) {
-            render_colors[pix_id * COLOR_DIM + k] =
-                backgrounds == nullptr ? pix_out[k]
-                                       : (pix_out[k] + T * backgrounds[k]);
+            render_colors[pix_id * COLOR_DIM + k] = backgrounds == nullptr ? pix_out[k]
+                                                       : (pix_out[k] + T * backgrounds[k]);
         }
 
-        // index in bin of last gaussian in this pixel
         last_ids[pix_id] = static_cast<int32_t>(cur_idx);
-
-        // index of gaussian with max visibility in this pixel
         max_ids[pix_id] = max_id;
-
-        // depth of the gaussian with max visibility in this pixel
         max_weight_depths[pix_id] = max_depth;
-
     }
 }
 
-
 template <uint32_t CDIM>
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim_approx(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,    // [C, N, 3] or [nnz, 3]
@@ -388,7 +286,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor &flatten_ids,   // [n_isects]
 
     // GT image
-    const at::optional<torch::Tensor> &gt_image // [C, image_height, image_width, channels]
+    const at::optional<torch::Tensor> &gt_image // [C, image_height, image_width, 3]
 ) {
     GSPLAT_DEVICE_GUARD(means2d);
     GSPLAT_CHECK_INPUT(means2d);
@@ -445,9 +343,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         {C, image_height, image_width, 1}, -1, means2d.options().dtype(torch::kFloat32)
     );
 
-    torch::Tensor accumulated_potential_loss = torch::zeros({C, N}, means2d.options().dtype(torch::kFloat32));
-
-
+    torch::Tensor accumulated_cur_colors = torch::zeros({C, N, 3}, means2d.options().dtype(torch::kFloat32));
+    torch::Tensor accumulated_final_colors = torch::zeros({C, N, 3}, means2d.options().dtype(torch::kFloat32));
+    torch::Tensor accumulated_one_minus_alphas = torch::zeros({C, N}, means2d.options().dtype(torch::kFloat32));
+    torch::Tensor accumulated_colors = torch::zeros({C, N, 3}, means2d.options().dtype(torch::kFloat32));
+    torch::Tensor accumulated_gt_colors = torch::zeros({C, N, 3}, means2d.options().dtype(torch::kFloat32));
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     const uint32_t shared_mem =
@@ -458,7 +358,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // channels into the kernel functions and avoid necessary global memory
     // writes. This requires moving the channel padding from python to C side.
     if (cudaFuncSetAttribute(
-            rasterize_to_pixels_fwd_kernel<CDIM, float>,
+            rasterize_to_pixels_fwd_approx_kernel<CDIM, float>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             shared_mem
         ) != cudaSuccess) {
@@ -468,7 +368,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             " bytes), try lowering tile_size."
         );
     }
-    rasterize_to_pixels_fwd_kernel<CDIM, float>
+    rasterize_to_pixels_fwd_approx_kernel<CDIM, float>
         <<<blocks, threads, shared_mem, stream>>>(
             C,
             N,
@@ -498,14 +398,18 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             accumulated_weights_value.data_ptr<float>(),
             accumulated_weights_count.data_ptr<int32_t>(),
             max_weight_depths.data_ptr<float>(),
-            accumulated_potential_loss.data_ptr<float>()
+            accumulated_cur_colors.data_ptr<float>(),
+            accumulated_final_colors.data_ptr<float>(),
+            accumulated_one_minus_alphas.data_ptr<float>(),
+            accumulated_colors.data_ptr<float>(),
+            accumulated_gt_colors.data_ptr<float>()
         );
 
-    return std::make_tuple(renders, alphas, last_ids, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths, accumulated_potential_loss);
+    return std::make_tuple(renders, alphas, last_ids, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths, accumulated_cur_colors, accumulated_final_colors, accumulated_one_minus_alphas, accumulated_colors, accumulated_gt_colors);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-rasterize_to_pixels_fwd_tensor(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+rasterize_to_pixels_fwd_approx_tensor(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,    // [C, N, 3] or [nnz, 3]
@@ -522,14 +426,14 @@ rasterize_to_pixels_fwd_tensor(
     const torch::Tensor &flatten_ids,   // [n_isects]
 
     // GT image
-    const at::optional<torch::Tensor> &gt_image // [C, image_height, image_width, channels]
+    const at::optional<torch::Tensor> &gt_image // [C, image_height, image_width, 3]
 ) {
     GSPLAT_CHECK_INPUT(colors);
     uint32_t channels = colors.size(-1);
 
 #define __GS__CALL_(N)                                                         \
     case N:                                                                    \
-        return call_kernel_with_dim<N>(                                        \
+        return call_kernel_with_dim_approx<N>(                                        \
             means2d,                                                           \
             conics,                                                            \
             colors,                                                            \

@@ -14,23 +14,18 @@
 
 ## 3. 구현해야 할 파일들
 
-### 3.1 gsplat/cuda/csrc/rasterize_to_pixels_fwd.cu
-- [ ] 각 Gaussian의 contribution 저장
-  - cur_color: 색 * alpha * transmission
-  - final rendered color
-- [ ] Depth 정보 저장
-  - 각 픽셀별 normalized depth 정보
-  - max_depth 정보
-- [ ] Visibility 정보 저장
-  - alpha * transmission 값
-- [ ] Potential loss 계산을 위한 정보 저장
-  - accumulated_potential_loss 업데이트
-  - accumulated_weights_value 업데이트
-  - accumulated_weights_count 업데이트
+### 3.1 gsplat/cuda/csrc/rasterize_to_pixels_fwd_approx.cu
+- [ ] 각 Gaussian의 contribution 저장, 픽셀별 정보를 따로 저장할 수 없으므로 (메모리 제한), 누적하여 평균을 구할 예정
+누적할 데이터
+  - cur_color: 색 * alpha * transmission (cur_color)
+  - final rendered color (pix_out)
+  - Transmission so far (T)
+ 
+Transmission을 저장할 필요가 있는지, 확인이 필요함. 
 
-### 3.2 gsplat/cuda/csrc/rasterize_to_pixels_bwd.cu
-- [ ] Forward pass에서 저장한 정보들을 backward pass에서 활용
-- [ ] Gradient 계산 시 새로운 정보들 반영
+max weight and depth -> 이 것은 다른 스크립트를 위해 필요하므로 유지 
+potential loss 구하는 파트 -> 필요없어짐짐
+
 
 ### 3.3 gsplat/cuda/csrc/bindings.cpp
 - [ ] 새로운 텐서들을 Python 인터페이스에 추가

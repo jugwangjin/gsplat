@@ -15,6 +15,7 @@ from .cuda._wrapper import (
     rasterize_to_pixels,
     rasterize_to_pixels_2dgs,
     spherical_harmonics,
+    rasterize_to_pixels_approx
 )
 from .distributed import (
     all_gather_int32,
@@ -54,6 +55,7 @@ def rasterization(
     gt_image: Optional[Tensor] = None,
     fully_fused_projection_outputs = None,
     isect_tiles_outputs = None, 
+    use_approx = False,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -566,8 +568,14 @@ def rasterization(
         n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
         render_colors, render_alphas = [], []
         max_ids, max_weights = [], []
-        accumulated_potential_loss = []
-        
+        if not use_approx:
+            accumulated_potential_loss = []
+        else:
+            accumulated_cur_colors = []
+            accumulated_final_colors = []
+            accumulated_one_minus_alphas = []
+            accumulated_colors = []
+            accumulated_gt_colors = []
 
         for i in range(n_chunks):
             colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
@@ -576,49 +584,95 @@ def rasterization(
                 if backgrounds is not None
                 else None
             )
-            render_colors_, render_alphas_, max_ids_, accumulated_weights_value_, accumulated_weights_count_, max_weight_depth_, accumulated_potential_loss_ = rasterize_to_pixels(
+            if use_approx:
+                render_colors_, render_alphas_, max_ids_, accumulated_weights_value_, accumulated_weights_count_, max_weight_depth_, accumulated_cur_colors_, accumulated_final_colors_, accumulated_one_minus_alphas_, accumulated_colors_, accumulated_gt_colors_ = rasterize_to_pixels_approx(
+                    means2d,
+                    conics,
+                    colors_chunk,
+                    opacities,
+                    width,
+                    height,
+                    tile_size,
+                    isect_offsets,
+                    flatten_ids,
+                    backgrounds=backgrounds_chunk,
+                    packed=packed,
+                    absgrad=absgrad,
+                    gt_image=gt_image[..., i * channel_chunk : (i + 1) * channel_chunk] if gt_image is not None else None,
+                )
+                render_colors.append(render_colors_)
+                render_alphas.append(render_alphas_)
+                max_ids.append(max_ids_)
+                accumulated_weights_value.append(accumulated_weights_value_)
+                accumulated_weights_count.append(accumulated_weights_count_)
+                max_weight_depth.append(max_weight_depth_)
+                accumulated_cur_colors.append(accumulated_cur_colors_)
+                accumulated_final_colors.append(accumulated_final_colors_)
+                accumulated_one_minus_alphas.append(accumulated_one_minus_alphas_)
+                accumulated_colors.append(accumulated_colors_)
+                accumulated_gt_colors.append(accumulated_gt_colors_)
+# render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depths, accumulated_cur_colors, accumulated_final_colors, accumulated_one_minus_alphas, accumulated_colors, accumulated_gt_colors
+            else: 
+                render_colors_, render_alphas_, max_ids_, accumulated_weights_value_, accumulated_weights_count_, max_weight_depth_, accumulated_potential_loss_ = rasterize_to_pixels(
+                    means2d,
+                    conics,
+                    colors_chunk,
+                    opacities,
+                    width,
+                    height,
+                    tile_size,
+                    isect_offsets,
+                    flatten_ids,
+                    backgrounds=backgrounds_chunk,
+                    packed=packed,
+                    absgrad=absgrad,
+                    gt_image=gt_image[..., i * channel_chunk : (i + 1) * channel_chunk] if gt_image is not None else None,
+                )
+                render_colors.append(render_colors_)
+                # render_alphas.append(render_alphas_)\
+                # max_ids.append(max_ids_)
+                # max_weights.append(max_weights_)
+                accumulated_potential_loss.append(accumulated_potential_loss_)
+            render_colors = torch.cat(render_colors, dim=-1)
+            render_alphas = render_alphas_  # discard the rest
+            max_ids = max_ids_ # discard the rest
+            accumulated_weights_value = accumulated_weights_value_
+            accumulated_weights_count = accumulated_weights_count_
+            max_weight_depth = max_weight_depth_
+            accumulated_potential_loss = accumulated_potential_loss_.stack(dim=-1).sum(dim=-1)
+    else:
+        if use_approx:
+            render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depth, accumulated_cur_colors, accumulated_final_colors, accumulated_one_minus_alphas, accumulated_colors, accumulated_gt_colors = rasterize_to_pixels_approx(
                 means2d,
                 conics,
-                colors_chunk,
+                colors,
                 opacities,
                 width,
                 height,
                 tile_size,
                 isect_offsets,
                 flatten_ids,
-                backgrounds=backgrounds_chunk,
+                backgrounds=backgrounds,
                 packed=packed,
                 absgrad=absgrad,
-                gt_image=gt_image[..., i * channel_chunk : (i + 1) * channel_chunk] if gt_image is not None else None,
+                gt_image=gt_image if gt_image is not None else None,  
             )
-            render_colors.append(render_colors_)
-            # render_alphas.append(render_alphas_)
-            # max_ids.append(max_ids_)
-            # max_weights.append(max_weights_)
-            accumulated_potential_loss.append(accumulated_potential_loss_)
-        render_colors = torch.cat(render_colors, dim=-1)
-        render_alphas = render_alphas_  # discard the rest
-        max_ids = max_ids_ # discard the rest
-        accumulated_weights_value = accumulated_weights_value_
-        accumulated_weights_count = accumulated_weights_count_
-        max_weight_depth = max_weight_depth_
-        accumulated_potential_loss = accumulated_potential_loss_.stack(dim=-1).sum(dim=-1)
-    else:
-        render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depth, accumulated_potential_loss = rasterize_to_pixels(
-            means2d,
-            conics,
-            colors,
-            opacities,
-            width,
-            height,
-            tile_size,
-            isect_offsets,
-            flatten_ids,
-            backgrounds=backgrounds,
-            packed=packed,
-            absgrad=absgrad,
-            gt_image=gt_image if gt_image is not None else None,  
-        )
+        else:
+            render_colors, render_alphas, max_ids, accumulated_weights_value, accumulated_weights_count, max_weight_depth, accumulated_potential_loss = rasterize_to_pixels(
+                means2d,
+                conics,
+                colors,
+                opacities,
+                width,
+                height,
+                tile_size,
+                isect_offsets,
+                flatten_ids,
+                backgrounds=backgrounds,
+                packed=packed,
+                absgrad=absgrad,
+                gt_image=gt_image if gt_image is not None else None,  
+            )
 
     if render_mode in ["ED", "RGB+ED", "RGB+ED+IW"]:
         # normalize the accumulated depth to get the expected depth
@@ -650,14 +704,23 @@ def rasterization(
                 "accumulated_weights_value": accumulated_weights_value,
                 "accumulated_weights_count": accumulated_weights_count,
                 "max_weight_depth": max_weight_depth,
-                "accumulated_potential_loss": accumulated_potential_loss,
             }
         )
 
-    meta.update({
-        "fully_fused_projection_outputs": fully_fused_projection_outputs,
-        # "isect_tiles_outputs": isect_tiles_outputs,
-    })
+    if use_approx:
+        meta.update({
+            "accumulated_cur_colors": accumulated_cur_colors,
+            "accumulated_final_colors": accumulated_final_colors,
+            "accumulated_one_minus_alphas": accumulated_one_minus_alphas,
+            "accumulated_colors": accumulated_colors,
+            "accumulated_gt_colors": accumulated_gt_colors,
+            "accumulated_weights_count": accumulated_weights_count,
+        })
+    else:
+        meta.update({
+            "accumulated_potential_loss": accumulated_potential_loss,
+        })
+
 
     return render_colors, render_alphas, meta
 

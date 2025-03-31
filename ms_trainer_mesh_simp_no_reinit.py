@@ -726,9 +726,11 @@ class Runner(BaseRunner):
                         assert_never(self.cfg.strategy)
 
                 n_gaussians = len(self.splats["means"])
-                if step in cfg.depth_reinit_iters and step < self.cfg.strategy.refine_stop_iter and n_gaussians > cfg.num_depth:
+                if step in cfg.depth_reinit_iters and step < self.cfg.strategy.refine_stop_iter:
+                # if step in cfg.depth_reinit_iters and step < self.cfg.strategy.refine_stop_iter and n_gaussians > cfg.num_depth:
 
                     sampling_factor = cfg.num_depth / float(n_gaussians)
+                    sampling_factor = 0.5
 
 
                     self.splats, self.optimizers = simplification_from_mesh_simp(

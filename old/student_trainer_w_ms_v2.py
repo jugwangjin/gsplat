@@ -74,7 +74,7 @@ fix_all_seeds(20202464)
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     # Path to the teacher's .pt files. With this, student is initialized with the teacher's GSs and gets supervised from teacher's depths.
     original_initialization: bool = False
     use_novel_view: bool = False

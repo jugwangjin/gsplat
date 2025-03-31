@@ -28,7 +28,7 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from fused_ssim import fused_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, visualize_id_maps, depth_reinitialization, simplification, simplification_with_approx
 from lib_bilagrid import (
     BilateralGrid,
     slice,
@@ -39,9 +39,11 @@ from lib_bilagrid import (
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy, MSDStrategy
 from gsplat.optimizers import SelectiveAdam
 from gsplat.utils import save_ply
+
+from ms_trainer_mesh_simp import Runner as BaseRunner
 
 
 @dataclass
@@ -54,6 +56,30 @@ class Config:
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
     render_traj_path: str = "interp"
+
+    depth_reinit_iters: List[int] = field(default_factory=lambda: [5_000, 10_000])
+    num_depth: int = 3_500_000
+    num_max: int = 10_000_000
+
+    subsampling_interval: int = 5000
+    subsampling_ratio: float = 0.75
+
+    # simp_iteration1: int = 15_000
+    # simp_iteration2: int = 20_000
+
+    simplification_start_step: int = 15_000
+    simplification_end_step: int = 20_000
+    simplification_num: int = 2
+    sampling_factor: float = 0.3
+    target_final_sampling_factor: Optional[float] = None
+    target_num_gaussians: Optional[int] = None
+    designated_sampling_factors: Optional[List[float]] = None
+
+    ascending: bool = False
+    apply_opacity: bool = False
+    use_mean: bool = False
+    sampling: bool = False
+    simplification_iterations: int = 1
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
@@ -83,13 +109,13 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [30_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [30_000])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -114,8 +140,8 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
-        default_factory=DefaultStrategy
+    strategy: Union[DefaultStrategy, MCMCStrategy, MSDStrategy] = field(
+        default_factory=MSDStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
@@ -188,6 +214,8 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
+
+
 
 
 def create_splats_with_optimizers(
@@ -276,233 +304,13 @@ def create_splats_with_optimizers(
     return splats, optimizers
 
 
-class Runner:
+class Runner(BaseRunner):
     """Engine for training and testing."""
 
     def __init__(
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
-        set_random_seed(42 + local_rank)
-
-        self.cfg = cfg
-        self.world_rank = world_rank
-        self.local_rank = local_rank
-        self.world_size = world_size
-        self.device = f"cuda:{local_rank}"
-
-        # Where to dump results.
-        os.makedirs(cfg.result_dir, exist_ok=True)
-
-        # Setup output directories.
-        self.ckpt_dir = f"{cfg.result_dir}/ckpts"
-        os.makedirs(self.ckpt_dir, exist_ok=True)
-        self.stats_dir = f"{cfg.result_dir}/stats"
-        os.makedirs(self.stats_dir, exist_ok=True)
-        self.render_dir = f"{cfg.result_dir}/renders"
-        os.makedirs(self.render_dir, exist_ok=True)
-        self.ply_dir = f"{cfg.result_dir}/ply"
-        os.makedirs(self.ply_dir, exist_ok=True)
-
-        # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
-
-        # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
-            normalize=cfg.normalize_world_space,
-            test_every=cfg.test_every,
-        )
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
-        )
-        self.valset = Dataset(self.parser, split="val")
-        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
-        print("Scene scale:", self.scene_scale)
-
-        # Model
-        feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers = create_splats_with_optimizers(
-            self.parser,
-            init_type=cfg.init_type,
-            init_num_pts=cfg.init_num_pts,
-            init_extent=cfg.init_extent,
-            init_opacity=cfg.init_opa,
-            init_scale=cfg.init_scale,
-            scene_scale=self.scene_scale,
-            sh_degree=cfg.sh_degree,
-            sparse_grad=cfg.sparse_grad,
-            visible_adam=cfg.visible_adam,
-            batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
-            device=self.device,
-            world_rank=world_rank,
-            world_size=world_size,
-        )
-        print("Model initialized. Number of GS:", len(self.splats["means"]))
-
-        # Densification Strategy
-        self.cfg.strategy.check_sanity(self.splats, self.optimizers)
-
-        if isinstance(self.cfg.strategy, DefaultStrategy):
-            self.strategy_state = self.cfg.strategy.initialize_state(
-                scene_scale=self.scene_scale
-            )
-        elif isinstance(self.cfg.strategy, MCMCStrategy):
-            self.strategy_state = self.cfg.strategy.initialize_state()
-        else:
-            assert_never(self.cfg.strategy)
-
-        # Compression Strategy
-        self.compression_method = None
-        if cfg.compression is not None:
-            if cfg.compression == "png":
-                self.compression_method = PngCompression()
-            else:
-                raise ValueError(f"Unknown compression strategy: {cfg.compression}")
-
-        self.pose_optimizers = []
-        if cfg.pose_opt:
-            self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
-            self.pose_adjust.zero_init()
-            self.pose_optimizers = [
-                torch.optim.Adam(
-                    self.pose_adjust.parameters(),
-                    lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size),
-                    weight_decay=cfg.pose_opt_reg,
-                )
-            ]
-            if world_size > 1:
-                self.pose_adjust = DDP(self.pose_adjust)
-
-        if cfg.pose_noise > 0.0:
-            self.pose_perturb = CameraOptModule(len(self.trainset)).to(self.device)
-            self.pose_perturb.random_init(cfg.pose_noise)
-            if world_size > 1:
-                self.pose_perturb = DDP(self.pose_perturb)
-
-        self.app_optimizers = []
-        if cfg.app_opt:
-            assert feature_dim is not None
-            self.app_module = AppearanceOptModule(
-                len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
-            ).to(self.device)
-            # initialize the last layer to be zero so that the initial output is zero.
-            torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
-            torch.nn.init.zeros_(self.app_module.color_head[-1].bias)
-            self.app_optimizers = [
-                torch.optim.Adam(
-                    self.app_module.embeds.parameters(),
-                    lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 10.0,
-                    weight_decay=cfg.app_opt_reg,
-                ),
-                torch.optim.Adam(
-                    self.app_module.color_head.parameters(),
-                    lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size),
-                ),
-            ]
-            if world_size > 1:
-                self.app_module = DDP(self.app_module)
-
-        self.bil_grid_optimizers = []
-        if cfg.use_bilateral_grid:
-            self.bil_grids = BilateralGrid(
-                len(self.trainset),
-                grid_X=cfg.bilateral_grid_shape[0],
-                grid_Y=cfg.bilateral_grid_shape[1],
-                grid_W=cfg.bilateral_grid_shape[2],
-            ).to(self.device)
-            self.bil_grid_optimizers = [
-                torch.optim.Adam(
-                    self.bil_grids.parameters(),
-                    lr=2e-3 * math.sqrt(cfg.batch_size),
-                    eps=1e-15,
-                ),
-            ]
-
-        # Losses & Metrics.
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
-
-        if cfg.lpips_net == "alex":
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="alex", normalize=True
-            ).to(self.device)
-        elif cfg.lpips_net == "vgg":
-            # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="vgg", normalize=False
-            ).to(self.device)
-        else:
-            raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
-
-        # Viewer
-        if not self.cfg.disable_viewer:
-            self.server = viser.ViserServer(port=cfg.port, verbose=False)
-            self.viewer = nerfview.Viewer(
-                server=self.server,
-                render_fn=self._viewer_render_fn,
-                mode="training",
-            )
-
-    def rasterize_splats(
-        self,
-        camtoworlds: Tensor,
-        Ks: Tensor,
-        width: int,
-        height: int,
-        masks: Optional[Tensor] = None,
-        **kwargs,
-    ) -> Tuple[Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
-
-        image_ids = kwargs.pop("image_ids", None)
-        if self.cfg.app_opt:
-            colors = self.app_module(
-                features=self.splats["features"],
-                embed_ids=image_ids,
-                dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
-                sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
-            )
-            colors = colors + self.splats["colors"]
-            colors = torch.sigmoid(colors)
-        else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
-
-        rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
-        render_colors, render_alphas, info = rasterization(
-            means=means,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=colors,
-            viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
-            Ks=Ks,  # [C, 3, 3]
-            width=width,
-            height=height,
-            packed=self.cfg.packed,
-            absgrad=(
-                self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
-                else False
-            ),
-            sparse_grad=self.cfg.sparse_grad,
-            rasterize_mode=rasterize_mode,
-            distributed=self.world_size > 1,
-            camera_model=self.cfg.camera_model,
-            **kwargs,
-        )
-        if masks is not None:
-            render_colors[~masks] = 0
-        return render_colors, render_alphas, info
+        super().__init__(local_rank, world_rank, world_size, cfg)        
 
     def train(self):
         cfg = self.cfg
@@ -552,11 +360,37 @@ class Runner:
             self.trainset,
             batch_size=cfg.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=1,
             persistent_workers=True,
             pin_memory=True,
         )
         trainloader_iter = iter(trainloader)
+
+        # simplification_iterations : 
+        simplification_strat_step = cfg.simplification_start_step
+        simplification_end_step = cfg.simplification_end_step
+        simplification_num = cfg.simplification_num
+        
+        if cfg.target_final_sampling_factor is not None:
+            cfg.sampling_factor = cfg.target_final_sampling_factor ** (1.0 / simplification_num)
+        print('cfg.sampling_factor:', cfg.sampling_factor)
+        print('cfg.target_final_sampling_factor:', cfg.target_final_sampling_factor)
+
+        # make simplification_iters list, the start and end step is included
+        simplification_iters = list(range(simplification_strat_step, simplification_end_step+1, (simplification_end_step - simplification_strat_step) // (simplification_num-1)))
+        print('simplification_iters:', simplification_iters)
+        print('simplification_start_step:', simplification_strat_step, 'simplification_end_step:', simplification_end_step, 'simplification_num:', simplification_num)
+
+        if cfg.designated_sampling_factors is not None: 
+            cfg.simplification_num = len(cfg.designated_sampling_factors)
+            simplification_num = cfg.simplification_num
+            simplification_iters = list(range(simplification_strat_step, simplification_end_step+1, (simplification_end_step - simplification_strat_step) // (simplification_num-1)))
+
+        pbar = tqdm.tqdm(range(init_step))
+        for step in pbar:
+            pbar.set_description("skipping")
+            for scheduler in schedulers:
+                scheduler.step()
 
         # Training loop.
         global_tic = time.time()
@@ -573,6 +407,36 @@ class Runner:
             except StopIteration:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
+
+            if (step+1) == cfg.simplification_start_step:
+                if cfg.target_num_gaussians is not None and cfg.designated_sampling_factors is None:
+                    
+                # if cfg.target_num_gaussians is not None:
+                    current_n_gaussians = len(self.splats["means"])
+                    target_n_gaussians = cfg.target_num_gaussians
+                    cfg.sampling_factor = (target_n_gaussians / current_n_gaussians) ** (1.0 / simplification_num)
+                    print('cfg.sampling_factor:', cfg.sampling_factor)
+                    print('target_n_gaussians:', target_n_gaussians)
+
+                    # current_n_gaussians = len(self.splats["means"])
+                    # target_n_gaussians = cfg.target_num_gaussians
+                    
+                    # # Create linear reduction schedule
+                    # simplification_num = cfg.simplification_num
+                    # wanted_n_gaussians = [
+                    #     int(current_n_gaussians - (current_n_gaussians - target_n_gaussians) * i / simplification_num)
+                    #     for i in range(simplification_num + 1)
+                    # ]
+                    
+                    # # Calculate per-step sampling factors needed to achieve linear reduction
+                    # cfg.designated_sampling_factors = [
+                    #     wanted_n_gaussians[i] / wanted_n_gaussians[i-1]
+                    #     for i in range(1, len(wanted_n_gaussians))
+                    # ]
+                    
+                    # # Verify final count
+                    # assert abs(cfg.designated_sampling_factors[-1] * wanted_n_gaussians[-2] - target_n_gaussians) < 1e-5
+
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
@@ -607,7 +471,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                render_mode="RGB+ED+IW" if cfg.depth_loss else "RGB+IW",
                 masks=masks,
             )
             if renders.shape[-1] == 4:
@@ -743,9 +607,10 @@ class Runner:
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
+
             if (
-                step in [i - 1 for i in cfg.ply_steps]
-                or step == max_steps - 1
+                (step in [i - 1 for i in cfg.ply_steps]
+                or step == max_steps - 1)
                 and cfg.save_ply
             ):
                 rgb = None
@@ -807,7 +672,121 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
+            if isinstance(self.cfg.strategy, MSDStrategy):
+                info.update({
+                    "depth_reinit_iter" : step in cfg.depth_reinit_iters,
+                    "num_max" : cfg.num_max,
+                }
+                )
+
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                )
+
+                n_gaussians = len(self.splats["means"])
+                if step in cfg.depth_reinit_iters and step < self.cfg.strategy.refine_stop_iter:
+                # if step in cfg.depth_reinit_iters and step < self.cfg.strategy.refine_stop_iter and n_gaussians > cfg.num_depth:
+
+                    sampling_factor = cfg.num_depth / float(n_gaussians)
+                    sampling_factor = 0.5
+
+
+                    self.splats, self.optimizers = simplification_with_approx(
+                        trainset = self.trainset,
+                        runner = self,
+                        parser = self.parser,
+                        cfg = self.cfg,
+                        sampling_factor = sampling_factor,
+                        keep_sh0 = True,
+                        # keep_feats = True,
+                        keep_feats = False,
+                        batch_size=cfg.batch_size,
+                        sparse_grad=cfg.sparse_grad,
+                        visible_adam=cfg.visible_adam,
+                        world_size=world_size,
+                        init_scale=cfg.init_scale,
+                        scene_scale=self.scene_scale,
+                        optimizers=self.optimizers,
+                        ascending=cfg.ascending,
+                        use_mean=cfg.use_mean,
+                        sampling=cfg.sampling,
+                        iterations=1,
+                        # iterations=cfg.simplification_iterations,
+                        apply_opacity=cfg.apply_opacity,
+                        trainloader=trainloader
+                    )
+                    
+                    print("Number of Gaussians before simplification: ", n_gaussians)
+                    print("Number of Gaussians after simplification: ", len(self.splats["means"]))
+
+
+                    self.cfg.strategy.check_sanity(self.splats, self.optimizers)
+
+                    if isinstance(self.cfg.strategy, DefaultStrategy):
+                        self.strategy_state = self.cfg.strategy.initialize_state(
+                            scene_scale=self.scene_scale
+                        )
+                    elif isinstance(self.cfg.strategy, MCMCStrategy):
+                        self.strategy_state = self.cfg.strategy.initialize_state()
+                    else:
+                        assert_never(self.cfg.strategy)
+                
+
+                # simplifications
+                
+                if (step+1) in simplification_iters:
+                    n_gaussians = len(self.splats["means"])
+
+                    if cfg.designated_sampling_factors is not None:
+                        cur_sampling_factor = cfg.designated_sampling_factors[simplification_iters.index(step+1)]
+                    else:
+                        cur_sampling_factor = cfg.sampling_factor
+
+                    self.splats, self.optimizers = simplification_from_mesh_simp(
+                        trainset = self.trainset,
+                        runner = self,
+                        parser = self.parser,
+                        cfg = self.cfg,
+                        sampling_factor = cur_sampling_factor,
+                        keep_sh0 = True,
+                        keep_feats = True,
+                        batch_size=cfg.batch_size,
+                        sparse_grad=cfg.sparse_grad,
+                        visible_adam=cfg.visible_adam,
+                        world_size=world_size,
+                        init_scale=cfg.init_scale,
+                        scene_scale=self.scene_scale,
+                        optimizers=self.optimizers,
+                        ascending=cfg.ascending,
+                        use_mean=cfg.use_mean,
+                        sampling=cfg.sampling,
+                        iterations=cfg.simplification_iterations,
+                        apply_opacity=cfg.apply_opacity,
+                        trainloader=trainloader
+                    )
+                    
+                    print("Number of Gaussians before simplification: ", n_gaussians)
+                    print("Number of Gaussians after simplification: ", len(self.splats["means"]))
+
+
+                    self.cfg.strategy.check_sanity(self.splats, self.optimizers)
+
+                    if isinstance(self.cfg.strategy, DefaultStrategy):
+                        self.strategy_state = self.cfg.strategy.initialize_state(
+                            scene_scale=self.scene_scale
+                        )
+                    elif isinstance(self.cfg.strategy, MCMCStrategy):
+                        self.strategy_state = self.cfg.strategy.initialize_state()
+                    else:
+                        assert_never(self.cfg.strategy)
+
+
+            elif isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -827,6 +806,24 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+
+
+            '''
+            reset learning rate by resetting scheduler - same as minisplatting 
+            '''
+
+            if step == self.cfg.strategy.refine_stop_iter: 
+                self.optimizers["means"].lr = 1.6e-4 * self.scene_scale
+                schedulers = [
+                    # means has a learning rate schedule, that end at 0.01 of the initial value
+                    torch.optim.lr_scheduler.ExponentialLR(
+                        self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                    ),
+                ]
+
+                for _ in range(5000):
+                    scheduler.step()
+
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -848,196 +845,6 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
-    @torch.no_grad()
-    def eval(self, step: int, stage: str = "val"):
-        """Entry for evaluation."""
-        print("Running evaluation...")
-        cfg = self.cfg
-        device = self.device
-        world_rank = self.world_rank
-        world_size = self.world_size
-
-        valloader = torch.utils.data.DataLoader(
-            self.valset, batch_size=1, shuffle=False, num_workers=1
-        )
-        ellipse_time = 0
-        metrics = defaultdict(list)
-        for i, data in enumerate(valloader):
-            camtoworlds = data["camtoworld"].to(device)
-            Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
-            masks = data["mask"].to(device) if "mask" in data else None
-            height, width = pixels.shape[1:3]
-
-            torch.cuda.synchronize()
-            tic = time.time()
-            colors, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                masks=masks,
-            )  # [1, H, W, 3]
-            torch.cuda.synchronize()
-            ellipse_time += time.time() - tic
-
-            colors = torch.clamp(colors, 0.0, 1.0)
-            canvas_list = [pixels, colors]
-
-            if world_rank == 0:
-                # write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
-                    canvas,
-                )
-
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
-                if cfg.use_bilateral_grid:
-                    cc_colors = color_correct(colors, pixels)
-                    cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                    metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
-
-        if world_rank == 0:
-            ellipse_time /= len(valloader)
-
-            stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
-            stats.update(
-                {
-                    "ellipse_time": ellipse_time,
-                    "num_GS": len(self.splats["means"]),
-                }
-            )
-            print(
-                f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                f"Time: {stats['ellipse_time']:.3f}s/image "
-                f"Number of GS: {stats['num_GS']}"
-            )
-            # save stats as json
-            with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
-                json.dump(stats, f)
-            # save stats to tensorboard
-            for k, v in stats.items():
-                self.writer.add_scalar(f"{stage}/{k}", v, step)
-            self.writer.flush()
-
-    @torch.no_grad()
-    def render_traj(self, step: int):
-        """Entry for trajectory rendering."""
-        print("Running trajectory rendering...")
-        cfg = self.cfg
-        device = self.device
-
-        camtoworlds_all = self.parser.camtoworlds[5:-5]
-        if cfg.render_traj_path == "interp":
-            camtoworlds_all = generate_interpolated_path(
-                camtoworlds_all, 1
-            )  # [N, 3, 4]
-        elif cfg.render_traj_path == "ellipse":
-            height = camtoworlds_all[:, 2, 3].mean()
-            camtoworlds_all = generate_ellipse_path_z(
-                camtoworlds_all, height=height
-            )  # [N, 3, 4]
-        elif cfg.render_traj_path == "spiral":
-            camtoworlds_all = generate_spiral_path(
-                camtoworlds_all,
-                bounds=self.parser.bounds * self.scene_scale,
-                spiral_scale_r=self.parser.extconf["spiral_radius_scale"],
-            )
-        else:
-            raise ValueError(
-                f"Render trajectory type not supported: {cfg.render_traj_path}"
-            )
-
-        camtoworlds_all = np.concatenate(
-            [
-                camtoworlds_all,
-                np.repeat(
-                    np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds_all), axis=0
-                ),
-            ],
-            axis=1,
-        )  # [N, 4, 4]
-
-        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
-        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
-        width, height = list(self.parser.imsize_dict.values())[0]
-
-        # save to video
-        video_dir = f"{cfg.result_dir}/videos"
-        os.makedirs(video_dir, exist_ok=True)
-        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
-        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
-            camtoworlds = camtoworlds_all[i : i + 1]
-            Ks = K[None]
-
-            renders, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
-            )  # [1, H, W, 4]
-            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
-            depths = renders[..., 3:4]  # [1, H, W, 1]
-            depths = (depths - depths.min()) / (depths.max() - depths.min())
-            canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
-
-            # write images
-            canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-            canvas = (canvas * 255).astype(np.uint8)
-            writer.append_data(canvas)
-        writer.close()
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
-
-    @torch.no_grad()
-    def run_compression(self, step: int):
-        """Entry for running compression."""
-        print("Running compression...")
-        world_rank = self.world_rank
-
-        compress_dir = f"{cfg.result_dir}/compression/rank{world_rank}"
-        os.makedirs(compress_dir, exist_ok=True)
-
-        self.compression_method.compress(compress_dir, self.splats)
-
-        # evaluate compression
-        splats_c = self.compression_method.decompress(compress_dir)
-        for k in splats_c.keys():
-            self.splats[k].data = splats_c[k].to(self.device)
-        self.eval(step=step, stage="compress")
-
-    @torch.no_grad()
-    def _viewer_render_fn(
-        self, camera_state: nerfview.CameraState, img_wh: Tuple[int, int]
-    ):
-        """Callable function for the viewer."""
-        W, H = img_wh
-        c2w = camera_state.c2w
-        K = camera_state.get_K(img_wh)
-        c2w = torch.from_numpy(c2w).float().to(self.device)
-        K = torch.from_numpy(K).float().to(self.device)
-
-        render_colors, _, _ = self.rasterize_splats(
-            camtoworlds=c2w[None],
-            Ks=K[None],
-            width=W,
-            height=H,
-            sh_degree=self.cfg.sh_degree,  # active all SH degrees
-            radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
-        )  # [1, H, W, 3]
-        return render_colors[0].cpu().numpy()
 
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
@@ -1057,7 +864,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
         step = ckpts[0]["step"]
-        runner.eval(step=step)
+        runner.eval(step=step, include_ids=True)
         runner.render_traj(step=step)
         if cfg.compression is not None:
             runner.run_compression(step=step)
@@ -1089,6 +896,12 @@ if __name__ == "__main__":
             "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
                 strategy=DefaultStrategy(verbose=True),
+            ),
+        ),
+        "msd": (
+            "Gaussian splatting training using densification from the paper 'Multi-Scale Densification for Neural Rendering'.",
+            Config(
+                strategy=MSDStrategy(verbose=True),
             ),
         ),
         "mcmc": (

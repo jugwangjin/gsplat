@@ -76,7 +76,7 @@ class Config:
 
     total_repeat: int = 1
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     use_novel_view: bool = False
     novel_view_weight: float = 0.25
     teacher_ckpt: str = None
