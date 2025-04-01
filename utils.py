@@ -500,7 +500,7 @@ def simplification_with_approx(
     apply_opacity=False,
     distance_sigma: float = 2e0,
     distance_alpha: float = 1e-1,
-    removal_chunk: int = 10,
+    removal_chunk: int = 100,
     max_removal_iterations: int = 1000,
     chunk_size_alive: int = 1e6,
     chunk_size_removed: int = 5e1,
@@ -559,43 +559,42 @@ def simplification_with_approx(
         print(f"Simplification iteration {it_iter + 1}/{iterations}")
         
         current_gaussians_to_remove = gaussians_to_remove // iterations 
-
         n_gaussians = runner.splats["means"].shape[0]
 
-        # Initialize accumulated values
-        accumulated_gt_colors = torch.zeros(n_gaussians, 3, device=device)
-        accumulated_final_colors = torch.zeros(n_gaussians, 3, device=device)
-        accumulated_cur_colors = torch.zeros(n_gaussians, 3, device=device)
-        accumulated_one_minus_alphas = torch.zeros(n_gaussians, device=device)
-        accumulated_colors = torch.zeros(n_gaussians, 3, device=device)
-        accumulated_weights_count = torch.zeros(n_gaussians, device=device)
-        radiis = torch.zeros(len(trainloader), n_gaussians, device=device)
-        conics = torch.zeros(len(trainloader), n_gaussians, 3, device=device)
-        means2ds = torch.zeros(len(trainloader), n_gaussians, 2, device=device)
-        valid_radiis = torch.zeros(len(trainloader), n_gaussians, device=device)
+        # 누적값 초기화 - 메모리 효율적인 방식으로
+        accumulated_values = {
+            "gt_colors": torch.zeros(n_gaussians, 3, device=device),
+            "final_colors": torch.zeros(n_gaussians, 3, device=device),
+            "cur_colors": torch.zeros(n_gaussians, 3, device=device),
+            "one_minus_alphas": torch.zeros(n_gaussians, device=device),
+            "colors": torch.zeros(n_gaussians, 3, device=device),
+            "weights_count": torch.zeros(n_gaussians, device=device)
+        }
+        
+        # 카메라별 데이터 저장용 텐서
+        camera_data = {
+            "radiis": torch.zeros(len(trainloader), n_gaussians, device=device),
+            "means2ds": torch.zeros(len(trainloader), n_gaussians, 2, device=device)
+        }
 
-        trainloader_iter = iter(trainloader)
+        gaussians_max_accumulated_weights = torch.zeros(n_gaussians, device=device)
+        gaussians_max_accumulated_weights_index = torch.zeros(n_gaussians, device=device, dtype=torch.int32)
 
-        # potential_loss = torch.zeros(n_gaussian, device=device)
-        # weights_count = torch.zeros(n_gaussian, device=device)
-
-        # Full pass: accumulate potential_loss
-        for batch_idx in tqdm.tqdm(range(len(trainloader)), desc="Compute potential loss"):
-            data = next(trainloader_iter)
-
+        # 데이터 수집 단계
+        for batch_idx, data in enumerate(tqdm.tqdm(trainloader, desc="Computing potential loss")):
+            # 데이터 준비
             pixel = data["image"].to(device) / 255.0
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None
 
-            height, width = pixel.shape[1:3]
-            # Render with current parameters
+            # 렌더링
             _, _, info = runner.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
-                width=width,
-                height=height,
+                width=pixel.shape[2],
+                height=pixel.shape[1],
                 sh_degree=0,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
@@ -606,117 +605,178 @@ def simplification_with_approx(
                 use_approx=True,
             )
 
-            # Accumulate values
-            gt_colors = info["accumulated_gt_colors"].sum(dim=0)
-            final_colors = info["accumulated_final_colors"].sum(dim=0)
-            cur_colors = info["accumulated_cur_colors"].sum(dim=0)
-            one_minus_alphas = info["accumulated_one_minus_alphas"].sum(dim=0)
-            colors = info["accumulated_colors"].sum(dim=0)
-            weights_count = info["accumulated_weights_count"].sum(dim=0)
+            # 누적값 업데이트
+            for key in ["gt_colors", "final_colors", "cur_colors", "colors"]:
+                accumulated_values[key] += info[f"accumulated_{key}"].sum(dim=0)
+            accumulated_values["one_minus_alphas"] += info["accumulated_one_minus_alphas"].sum(dim=0)
+            accumulated_values["weights_count"] += info["accumulated_weights_count"].sum(dim=0)
 
-            accumulated_gt_colors += gt_colors
-            accumulated_final_colors += final_colors
-            accumulated_cur_colors += cur_colors
-            accumulated_one_minus_alphas += one_minus_alphas
-            accumulated_colors += colors
-            accumulated_weights_count += weights_count
+            # 카메라별 데이터 저장
+            camera_data["radiis"][batch_idx] = info["radii"][0]
+            camera_data["means2ds"][batch_idx] = info["means2d"][0]
 
-            radiis[batch_idx] = info["radii"][0]
-            conics[batch_idx] = info["conics"][0]
-            means2ds[batch_idx] = info["means2d"][0]
-            valid_radiis[batch_idx] = info["radii"][0] > 0
+            accumulated_weights_value = info["accumulated_weights_value"].sum(dim=0)
+            # accumulated_weights_count = info["accumulated_weights_count"].sum(dim=0)
 
+            # for current camera, if the accumulated_weights_value > gaussians_max_accumulated_weights, update it on the index and apply batch_idx to the gaussians_max_accumulated_weights_index
+            gaussians_max_accumulated_weights_index = torch.where(accumulated_weights_value > gaussians_max_accumulated_weights, batch_idx, gaussians_max_accumulated_weights_index)
+            gaussians_max_accumulated_weights = torch.where(accumulated_weights_value > gaussians_max_accumulated_weights, accumulated_weights_value, gaussians_max_accumulated_weights)
 
-        accumulated_weights_count = accumulated_weights_count.clamp(min=1)
+            # 중간 메모리 정리
+            torch.cuda.empty_cache()
 
+        # 누적값 정규화
+        weights_count = accumulated_values["weights_count"].clamp(min=1).unsqueeze(-1)
+        for key in ["gt_colors", "final_colors", "cur_colors", "colors"]:
+            accumulated_values[key] /= weights_count
+        accumulated_values["one_minus_alphas"] /= accumulated_values["weights_count"].clamp(min=1)
 
-        accumulated_gt_colors = accumulated_gt_colors / accumulated_weights_count.unsqueeze(-1)
-        accumulated_final_colors = accumulated_final_colors / accumulated_weights_count.unsqueeze(-1)
-        accumulated_cur_colors = accumulated_cur_colors / accumulated_weights_count.unsqueeze(-1)
-        accumulated_one_minus_alphas = accumulated_one_minus_alphas / accumulated_weights_count
-        accumulated_colors = accumulated_colors / accumulated_weights_count.unsqueeze(-1)
-
-        # Initialize alive mask
+        # 가우시안 제거 단계
         alive_mask = torch.ones(n_gaussians, dtype=torch.bool, device=device)
         n_alive = n_gaussians
-
         current_target_gaussians = n_alive - current_gaussians_to_remove
 
+        # # FIX REMOVAL_CHUNK TO 1
+        # removal_chunk = 1
 
-
-        # Progressive removal loop
         total_to_remove = n_alive - current_target_gaussians
-        pbar = tqdm.tqdm(total=total_to_remove, desc="Removing Gaussians")
-        
-        while n_alive > current_target_gaussians:
-            alive_accumulated_gt_colors = accumulated_gt_colors[alive_mask]
-            alive_accumulated_colors = accumulated_colors[alive_mask]
-            alive_accumulated_final_colors = accumulated_final_colors[alive_mask]
-            alive_accumulated_cur_colors = accumulated_cur_colors[alive_mask]
-            alive_accumulated_one_minus_alphas = accumulated_one_minus_alphas[alive_mask]
+        with tqdm.tqdm(total=total_to_remove, desc="Removing Gaussians") as pbar:
+            # 미리 계산된 값들
+            alive_indices = alive_mask.nonzero(as_tuple=True)[0]
+            n_alive = len(alive_indices)
+            
+            # 메모리 재사용을 위한 텐서
+            distances = torch.empty((n_alive, removal_chunk), device=device)
+            similarities = torch.empty((n_alive, removal_chunk), device=device)
+            alive_potential_loss_increase = torch.empty(n_alive, device=device)
+            
+            while n_alive > current_target_gaussians:
+                # 살아있는 가우시안 데이터 추출 - 딕셔너리 대신 직접 접근
+                alive_colors = accumulated_values["colors"][alive_mask]
+                alive_final_colors = accumulated_values["final_colors"][alive_mask]
+                alive_cur_colors = accumulated_values["cur_colors"][alive_mask]
+                alive_gt_colors = accumulated_values["gt_colors"][alive_mask]
+                alive_one_minus_alphas = accumulated_values["one_minus_alphas"][alive_mask]
+                
+                # 잠재적 색상 계산 - 메모리 효율적으로
+                alive_potential_final_colors = (
+                    alive_colors + 
+                    (alive_final_colors - alive_colors - alive_cur_colors) / 
+                    (alive_one_minus_alphas.unsqueeze(-1) + 1e-6)
+                ).clamp(min=0, max=1)
 
-            alive_potential_final_colors = (alive_accumulated_final_colors - alive_accumulated_cur_colors).clamp(min=0, max=1)
-            # alive_potential_final_colors = (alive_accumulated_colors + (alive_accumulated_final_colors - alive_accumulated_colors - alive_accumulated_cur_colors) / (alive_accumulated_one_minus_alphas.unsqueeze(-1) + 1e-6)).clamp(min=0, max=1)
+                # 손실 계산 - 벡터화
+                alive_current_loss = torch.abs(alive_gt_colors - alive_final_colors)
+                alive_potential_loss = torch.abs(alive_gt_colors - alive_potential_final_colors)
+                alive_potential_loss_increase = (alive_potential_loss - alive_current_loss).sum(dim=1)
 
-            # print(alive_accumulated_colors.amin(), alive_accumulated_colors.amax(), alive_accumulated_final_colors.amin(), alive_accumulated_final_colors.amax(), alive_accumulated_cur_colors.amin(), alive_accumulated_cur_colors.amax(), alive_accumulated_one_minus_alphas.amin(), alive_accumulated_one_minus_alphas.amax())
-
-            alive_current_loss = torch.abs(alive_accumulated_gt_colors - alive_accumulated_final_colors)
-
-            alive_potential_loss = torch.abs(alive_accumulated_gt_colors - alive_potential_final_colors)
-
-            alive_potential_loss_increase = alive_potential_loss - alive_current_loss
-
-            alive_potential_loss_increase = alive_potential_loss_increase.sum(dim=1)
-
-            alive_potential_loss_increase = alive_potential_loss_increase - torch.amin(alive_potential_loss_increase)
-
-            # Determine removal order based on sampling option
-            if sampling:
-                probs = 1 / (alive_potential_loss_increase + 1e-6)
-                indices_to_remove = torch.multinomial(probs, num_samples=min(removal_chunk, n_alive - gaussians_to_keep), replacement=False)
-            else:
-                if ascending:
-                    indices_to_remove = torch.argsort(alive_potential_loss_increase)[-removal_chunk:]
+                # 제거할 가우시안 선택 - 최적화된 샘플링
+                chunk_size = min(removal_chunk, n_alive - gaussians_to_keep)
+                if chunk_size <= 0:
+                    break
+                    
+                if sampling:
+                    alive_potential_loss_increase -= torch.amin(alive_potential_loss_increase)
+                    probs = 1 / (alive_potential_loss_increase + 1e-6)
+                    indices_to_remove = torch.multinomial(probs, num_samples=chunk_size, replacement=False)
                 else:
-                    indices_to_remove = torch.argsort(alive_potential_loss_increase)[:removal_chunk]
+                    indices_to_remove = torch.argsort(alive_potential_loss_increase, descending=ascending)[:chunk_size]
 
-            removed_potential_colors = alive_potential_final_colors[indices_to_remove]
+                # # 인덱스 범위 체크
+                # if indices_to_remove.max() >= len(alive_indices):
+                #     print(f"Warning: Invalid index detected. Max index: {indices_to_remove.max()}, Alive indices length: {len(alive_indices)}")
+                #     break
 
-            # Update final colors using correlation
-            accumulated_final_colors = update_final_colors_with_correlation(
-                means2ds, conics, radiis, valid_radiis,
-                accumulated_final_colors, removed_potential_colors,
-                indices_to_remove, alive_mask,
-                distance_sigma, distance_alpha, num_camera
-            )
+                removal_mask = torch.zeros_like(alive_mask)    
+                indices_to_remove_global = alive_indices[indices_to_remove]
+                removal_mask[indices_to_remove_global] = True
+                
+                # 각 가우시안의 카메라 인덱스 가져오기
+                removed_camera_indices = gaussians_max_accumulated_weights_index[indices_to_remove_global]
+                
+                # 카메라별 투표 수 계산
+                camera_votes = torch.bincount(removed_camera_indices, minlength=len(camera_data["means2ds"]))
+                
+                # 가장 많은 투표를 받은 카메라 하나만 선택
+                cam_idx = camera_votes.argmax()
 
-            # Update alive mask
-            alive_mask[indices_to_remove] = False
-            n_alive = alive_mask.sum().item()
+                # 카메라 데이터 추출
+                cam_means2ds = camera_data["means2ds"][cam_idx]
+                cam_radiis = camera_data["radiis"][cam_idx]
+                
+                # 유효한 가우시안만 선택 (반경 > 0)
+                valid_mask = cam_radiis > 0
+                if not valid_mask.any():
+                    continue
+                    
+                valid_alive_mask = alive_mask & valid_mask
+                valid_removed_mask = removal_mask & valid_mask
+                
+                if not valid_alive_mask.any() or not valid_removed_mask.any():
+                    continue
+                
+                # 거리 계산 - 메모리 효율적으로
+                alive_means = cam_means2ds[valid_alive_mask]
+                removed_means = cam_means2ds[valid_removed_mask]
+                
+                # 브로드캐스팅을 활용한 거리 계산
+                diff = alive_means.unsqueeze(1) - removed_means.unsqueeze(0)
+                distances = (diff * diff).sum(dim=-1)
+                
+                # 반경 계산 - 벡터화
+                alive_radiis = cam_radiis[valid_alive_mask]
+                removed_radiis = cam_radiis[valid_removed_mask]
+                
+                radii_sum = (alive_radiis.unsqueeze(1) + removed_radiis.unsqueeze(0)).pow(2)
+                radii_diff = (alive_radiis.unsqueeze(1) - removed_radiis.unsqueeze(0)).pow(2)
+                
+                # 유사도 계산 - 메모리 재사용
+                normalized_distances = ((distances - radii_diff) / (radii_sum - radii_diff + 1e-10)).clamp(min=0, max=1)
+                similarities = (1 - normalized_distances) / chunk_size
+                
+                # 색상 업데이트 - 벡터화 (유효한 가우시안만)
+                valid_alive_indices = valid_alive_mask.nonzero(as_tuple=True)[0]
+                valid_removed_indices = valid_removed_mask.nonzero(as_tuple=True)[0]
+                
+                print(accumulated_values["final_colors"].shape, similarities.shape, alive_potential_final_colors.shape, accumulated_values["final_colors"][valid_alive_indices].shape, )
+                print(alive_potential_final_colors[valid_removed_indices].shape)
+                # 유효한 가우시안에 대해서만 색상 업데이트
+                accumulated_values["final_colors"][valid_alive_indices] = (
+                    accumulated_values["final_colors"][valid_alive_indices] * (1 - similarities.sum(dim=1)).unsqueeze(-1) + 
+                    torch.mm(similarities, alive_potential_final_colors[valid_removed_indices])
+                )
 
-            # Update progress bar
-            removed_this_iter = len(indices_to_remove)
-            pbar.update(removed_this_iter)
-            pbar.set_postfix({
-                'remaining': n_alive - current_target_gaussians,
-                'loss_increase': alive_potential_loss_increase.mean().item(),
-                'pot': alive_potential_final_colors.mean().item()
-            })
+                # 마스크 업데이트 - 안전하게
+                try:
+                    alive_mask[indices_to_remove_global] = False
+                    alive_indices = alive_mask.nonzero(as_tuple=True)[0]
+                    n_alive = len(alive_indices)
+                except RuntimeError as e:
+                    print(f"Warning: Error updating mask. Error: {e}")
+                    break
 
-            if n_alive <= 0:
-                raise ValueError("No Gaussians left to remove")
-        
-        pbar.close()
+                # 진행 상황 업데이트
+                pbar.update(chunk_size)
+                pbar.set_postfix({
+                    'target': current_target_gaussians,
+                    'remaining': n_alive
+                })
 
+                if n_alive <= 0:
+                    raise ValueError("No Gaussians left to remove")
 
+                # 메모리 정리
+                torch.cuda.empty_cache()
 
-
-        # (C) physical prune
+        # 물리적 가우시안 제거
         pruning_mask = ~alive_mask
         if keep_feats or iterations != 1:
-            splats, optimizers = remove_return(runner.splats, optimizers,
-                                               runner.strategy_state,
-                                               pruning_mask)
+            splats, optimizers = remove_return(
+                runner.splats, 
+                optimizers,
+                runner.strategy_state,
+                pruning_mask
+            )
         else:
             splats, optimizers = create_splats_and_optimizers_from_data(
                 runner.splats["means"][alive_mask],
@@ -1623,80 +1683,59 @@ def recover_covariance_2d(conics: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def update_final_colors_with_correlation(
-    means2ds, conics, radiis, valid_radiis,
+    means2ds, radiis,
     accumulated_final_colors, removed_potential_colors,
     indices_to_remove, alive_mask,
     distance_sigma=2e0, distance_alpha=1e-1,
     num_camera=1,
 ):
-    """KL 발산 기반 최종 색상 업데이트 함수
-    
-    Args:
-        means2ds: 모든 가우시안의 2D 평균 위치 [C, N, 2]
-        conics: 모든 가우시안의 conic 행렬 [C, N, 3]
-        radiis: 모든 가우시안의 반경 [C, N]
-        accumulated_final_colors: 누적된 최종 색상 [N, 3]
-        removed_potential_colors: 제거된 가우시안의 잠재적 색상 [n_remove, 3]
-        indices_to_remove: 제거할 가우시안의 인덱스
-        alive_mask: 생존한 가우시안의 마스크
-        distance_sigma: 거리 시그마
-        distance_alpha: 거리 알파
-        num_camera: 카메라 수
-    """
+    """KL 발산 기반 최종 색상 업데이트 함수"""
     device = means2ds.device
     N = means2ds.shape[1]  # 가우시안 수
     n_remove = len(indices_to_remove)
-    alive_indices = torch.where(alive_mask)[0]
-    n_alive = len(alive_indices)
+    n_alive = torch.sum(alive_mask)
     
     # 모든 카메라의 유사도 누적
-    similarities_sum = torch.zeros(n_alive, device=device)
+    # similarities_sum = torch.zeros(n_alive, device=device)
     
-    # 모든 카메라에 대해 한 번에 처리
-    for cam_idx in range(num_camera):
-        # 현재 카메라의 means2ds와 conics
+    # 카메라별로 처리하되 내부 연산은 최적화
+    for cam_idx in num_camera:
+        # 현재 카메라의 데이터 추출
         cam_means2ds = means2ds[cam_idx]  # [N, 2]
-        cam_conics = conics[cam_idx]  # [N, 3]
         cam_radiis = radiis[cam_idx]  # [N]
 
-        # get the indices of radii > 0
-        alive_valid_mask = valid_radiis[alive_indices] 
-        removed_valid_mask = valid_radiis[indices_to_remove]
+        # 살아있는 가우시안과 제거할 가우시안의 데이터
+        # alive_means = cam_means2ds[alive_mask]  # [n_alive, 2]
+        # removed_means = cam_means2ds[indices_to_remove]  # [n_remove, 2]
+        alive_radiis = cam_radiis[alive_mask]  # [n_alive]
+        removed_radiis = cam_radiis[indices_to_remove]  # [n_remove]
+
+        # 거리 계산 [n_alive, n_remove]
+        distances = torch.pow(
+            cam_means2ds[alive_mask].unsqueeze(1) - cam_means2ds[indices_to_remove].unsqueeze(0), 
+            2
+        ).sum(dim=-1)
+
+        # 반경 관련 계산 [n_alive, n_remove]
+        radii_sum = (alive_radiis.unsqueeze(1) + removed_radiis.unsqueeze(0)).pow(2).sum(dim=-1)
+        radii_diff = (torch.abs(alive_radiis.unsqueeze(1) - removed_radiis.unsqueeze(0))).pow(2).sum(dim=-1)
+
+        # 정규화된 거리와 유사도 계산
+        normalized_distances = ((distances - radii_diff) / (radii_sum - radii_diff + 1e-10)).clamp(min=0, max=1)
+        similarities = (1 - normalized_distances) / (len(num_camera) * n_remove)
         
-        # KL 발산 기반 유사도 계산
-        similarities = calculate_gaussian_kl_batch(
-            cam_means2ds[alive_indices],
-            cam_conics[alive_indices],
-            cam_means2ds[indices_to_remove],
-            cam_conics[indices_to_remove],
-            alive_valid_mask,
-            removed_valid_mask
-        )  # [n_alive, n_remove]
-        
-        # 반경 기반 가중치 적용
-        # radius_weights = torch.exp(-cam_radiis[indices_to_remove] / distance_sigma)
-        # similarities = similarities * radius_weights.unsqueeze(0)
-        
-        # 유사도 정규화 및 누적
-        similarities = similarities / (num_camera * n_remove)
-        similarities_sum = similarities.sum(dim=1)
-        
-        # 색상 보간
+        # 유사도 누적
+        # similarities_sum = similarities.sum(dim=1)
+
+        # 중간 텐서 메모리 해제
+        # del distances, radii_sum, radii_diff, normalized_distances
+        torch.cuda.empty_cache()
+
+        # 색상 보간 - 한 번에 처리
         accumulated_final_colors[alive_mask] = (
-            accumulated_final_colors[alive_mask] * (1 - similarities_sum).unsqueeze(-1) + 
-            (removed_potential_colors.unsqueeze(0) * similarities.unsqueeze(-1)).sum(dim=1)
+            accumulated_final_colors[alive_mask] * (1 - similarities.sum(dim=1)).unsqueeze(-1) + 
+            torch.mm(similarities, removed_potential_colors)
         )
-
-        # if nan or inf in similarities_sum, raise
-        # if torch.isnan(similarities_sum).any() or torch.isinf(similarities_sum).any():
-        #     raise ValueError('nan or inf in similarities_sum')
-
-    # print('means2ds.mean(dim=1)', means2ds.mean(dim=1))
-    # print('means2ds.std(dim=1)', means2ds.std(dim=1))
-    # print('conics.mean(dim=1)', conics.mean(dim=1))
-    # print('conics.std(dim=1)', conics.std(dim=1))
-    # print('radiis.mean(dim=1)', radiis.mean(dim=1))
-    # print('radiis.std(dim=1)', radiis.std(dim=1))
 
     return accumulated_final_colors
 

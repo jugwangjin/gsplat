@@ -15,6 +15,7 @@ def read_num_gaussians(result_dir: str) -> int:
 
 def check_experiment_completed(result_dir: str) -> bool:
     """Check if the experiment is already completed"""
+    os.listdir(os.path.join(result_dir, 'ckpts'))
     checkpoint_path = os.path.join(result_dir, 'ckpts', 'ckpt_29999_rank0.pt')
     return os.path.exists(checkpoint_path)
 
@@ -34,7 +35,7 @@ def main():
         ]
 
         # 공통 파라미터
-        eval_steps = "19999 20001 29999"
+        eval_steps = "19999 20001 30000"
         data_factor = 4
         base_data_dir = "/Bean/data/gwangjin/2025/kdgs/360_v2"
         base_result_dir = "/Bean/log/gwangjin/2025/kdgs/simplification_comparison_dif_4"

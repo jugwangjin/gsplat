@@ -730,7 +730,7 @@ class Runner(BaseRunner):
                 # if step in cfg.depth_reinit_iters and step < self.cfg.strategy.refine_stop_iter and n_gaussians > cfg.num_depth:
 
                     sampling_factor = cfg.num_depth / float(n_gaussians)
-                    sampling_factor = 0.5
+                    sampling_factor = 0.8
 
 
                     self.splats, self.optimizers = simplification_from_mesh_simp(
@@ -740,8 +740,8 @@ class Runner(BaseRunner):
                         cfg = self.cfg,
                         sampling_factor = sampling_factor,
                         keep_sh0 = True,
-                        # keep_feats = True,
-                        keep_feats = False,
+                        keep_feats = True,
+                        # keep_feats = False,
                         batch_size=cfg.batch_size,
                         sparse_grad=cfg.sparse_grad,
                         visible_adam=cfg.visible_adam,
@@ -752,8 +752,8 @@ class Runner(BaseRunner):
                         ascending=cfg.ascending,
                         use_mean=cfg.use_mean,
                         sampling=cfg.sampling,
-                        iterations=1,
-                        # iterations=cfg.simplification_iterations,
+                        # iterations=1,
+                        iterations=cfg.simplification_iterations,
                         apply_opacity=cfg.apply_opacity,
                         trainloader=trainloader
                     )
